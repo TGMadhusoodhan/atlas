@@ -89,10 +89,8 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
         SettingsDialog(
             onlineEnabled = state.onlineEnabled,
             hasApiKey = state.hasApiKey,
-            hasPicovoiceKey = state.hasPicovoiceKey,
             onToggleOnline = viewModel::setOnline,
             onSaveKey = viewModel::saveApiKey,
-            onSavePicovoiceKey = viewModel::savePicovoiceKey,
             onDismiss = { showSettings = false },
         )
     }
@@ -217,14 +215,11 @@ private fun InputBar(
 private fun SettingsDialog(
     onlineEnabled: Boolean,
     hasApiKey: Boolean,
-    hasPicovoiceKey: Boolean,
     onToggleOnline: (Boolean) -> Unit,
     onSaveKey: (String) -> Unit,
-    onSavePicovoiceKey: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var key by remember { mutableStateOf("") }
-    var pvKey by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Settings") },
@@ -247,19 +242,8 @@ private fun SettingsDialog(
                     singleLine = true,
                 )
                 Text(
-                    if (hasPicovoiceKey) "Picovoice key (Hey Atlas): saved" else "Picovoice key (Hey Atlas): not set",
-                    style = MaterialTheme.typography.labelMedium,
-                    modifier = Modifier.padding(top = 12.dp),
-                )
-                OutlinedTextField(
-                    value = pvKey,
-                    onValueChange = { pvKey = it },
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                    placeholder = { Text("Paste Picovoice AccessKey") },
-                    singleLine = true,
-                )
-                Text(
-                    "Voice needs the Picovoice key + the Hey-Atlas keyword & Vosk model assets (see VOICE_SETUP).",
+                    "Off / no key / offline → ATLAS answers fully on-device. " +
+                        "Voice (“Hey Atlas”) just needs the Vosk model asset — see VOICE_SETUP.",
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier.padding(top = 8.dp),
                 )
@@ -268,7 +252,6 @@ private fun SettingsDialog(
         confirmButton = {
             TextButton(onClick = {
                 if (key.isNotBlank()) onSaveKey(key.trim())
-                if (pvKey.isNotBlank()) onSavePicovoiceKey(pvKey.trim())
                 onDismiss()
             }) { Text("Save") }
         },

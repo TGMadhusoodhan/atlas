@@ -30,7 +30,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val error: String? = null,
         val onlineEnabled: Boolean = true,
         val hasApiKey: Boolean = false,
-        val hasPicovoiceKey: Boolean = false,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -40,12 +39,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var nextId = 1L
 
     init {
-        _state.update {
-            it.copy(
-                hasApiKey = container.secrets.deepSeekApiKey != null,
-                hasPicovoiceKey = container.secrets.picovoiceAccessKey != null,
-            )
-        }
+        _state.update { it.copy(hasApiKey = container.secrets.deepSeekApiKey != null) }
         viewModelScope.launch {
             container.settings.onlineEnabled.collect { on ->
                 _state.update { it.copy(onlineEnabled = on) }
@@ -56,11 +50,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun saveApiKey(key: String) {
         container.secrets.deepSeekApiKey = key
         _state.update { it.copy(hasApiKey = container.secrets.deepSeekApiKey != null) }
-    }
-
-    fun savePicovoiceKey(key: String) {
-        container.secrets.picovoiceAccessKey = key
-        _state.update { it.copy(hasPicovoiceKey = container.secrets.picovoiceAccessKey != null) }
     }
 
     fun setOnline(enabled: Boolean) {

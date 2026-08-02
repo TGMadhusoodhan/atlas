@@ -114,9 +114,9 @@ dependencies {
     // WorkManager — schedules reminder notifications
     implementation("androidx.work:work-runtime-ktx:2.9.1")
 
-    // Voice (M3): Porcupine "Hey Atlas" wake word + Vosk offline STT.
+    // Voice (M3): Vosk does both the "Hey Atlas" wake word (grammar keyword-spotting)
+    // and offline command STT — no account, nothing leaves the device.
     // (TTS uses the built-in android.speech.tts.TextToSpeech — no dependency.)
-    implementation("ai.picovoice:porcupine-android:3.0.3")
     implementation("com.alphacephei:vosk-android:0.3.75")
 
     debugImplementation("androidx.compose.ui:ui-tooling")

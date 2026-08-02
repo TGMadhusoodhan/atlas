@@ -7,29 +7,41 @@ import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
 
 /**
- * Offline speech-to-text via Vosk (nothing leaves the device). [listen] captures one
- * spoken command and calls [onFinal] with the transcript once Vosk detects end-of-speech
- * (its built-in endpointing), then the caller stops it. The [Model] is loaded once by the
- * service from the bundled Vosk model assets.
+ * Offline speech via Vosk (nothing leaves the device), used for BOTH jobs:
+ *  - wake word: [start] with [WAKE_GRAMMAR] so the recognizer only listens for
+ *    "hey atlas" — cheap keyword-spotting, no separate hotword engine/account.
+ *  - command: [start] with grammar = null for full free-form transcription.
+ *
+ * Only one [SpeechService] runs at a time; the service [stop]s one before starting the
+ * next, so the single mic is never contended.
  */
 class VoskStt(private val model: Model) {
 
     private var service: SpeechService? = null
 
-    fun listen(onFinal: (String) -> Unit, onError: (String) -> Unit) {
+    fun start(
+        grammar: String?,
+        onPartial: (String) -> Unit,
+        onResult: (String) -> Unit,
+        onError: (String) -> Unit,
+    ) {
         try {
-            val recognizer = Recognizer(model, SAMPLE_RATE)
+            val recognizer =
+                if (grammar != null) Recognizer(model, SAMPLE_RATE, grammar)
+                else Recognizer(model, SAMPLE_RATE)
             service = SpeechService(recognizer, SAMPLE_RATE).also {
                 it.startListening(object : RecognitionListener {
-                    override fun onPartialResult(hypothesis: String?) {}
-                    override fun onResult(hypothesis: String?) = onFinal(extractText(hypothesis))
+                    override fun onPartialResult(hypothesis: String?) =
+                        onPartial(extract(hypothesis, "partial"))
+                    override fun onResult(hypothesis: String?) =
+                        onResult(extract(hypothesis, "text"))
                     override fun onFinalResult(hypothesis: String?) {}
                     override fun onError(e: Exception?) = onError(e?.message ?: "speech error")
-                    override fun onTimeout() = onFinal("")
+                    override fun onTimeout() = onResult("")
                 })
             }
         } catch (e: Exception) {
-            Log.e("ATLAS", "Vosk listen failed: ${e.message}")
+            Log.e("ATLAS", "Vosk start failed: ${e.message}")
             onError(e.message ?: "speech init error")
         }
     }
@@ -40,13 +52,16 @@ class VoskStt(private val model: Model) {
         service = null
     }
 
-    /** Vosk returns JSON like {"text":"turn on the flashlight"}. */
-    private fun extractText(json: String?): String {
+    /** Vosk returns {"text":"…"} for finals and {"partial":"…"} for partials. */
+    private fun extract(json: String?, field: String): String {
         if (json.isNullOrBlank()) return ""
-        return Regex("\"text\"\\s*:\\s*\"([^\"]*)\"").find(json)?.groupValues?.get(1)?.trim().orEmpty()
+        return Regex("\"$field\"\\s*:\\s*\"([^\"]*)\"").find(json)?.groupValues?.get(1)?.trim().orEmpty()
     }
 
     companion object {
         private const val SAMPLE_RATE = 16000.0f
+
+        /** Restrict the recognizer to the wake phrase (plus [unk] for everything else). */
+        const val WAKE_GRAMMAR = "[\"hey atlas\", \"[unk]\"]"
     }
 }

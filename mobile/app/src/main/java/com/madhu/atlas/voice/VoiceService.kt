@@ -26,14 +26,15 @@ import kotlin.coroutines.resume
 
 /**
  * Always-listening "Hey Atlas" voice pipeline, as a microphone foreground service.
+ * Vosk does both jobs — no third-party wake-word engine or account:
  *
- * State machine: WAKE (Porcupine) → LISTENING (Vosk STT) → THINKING (shared agent loop)
- * → SPEAKING (TTS) → back to WAKE. The single mic is handed between Porcupine and Vosk,
- * and the wake word is paused while ATLAS talks so it doesn't trigger on itself.
+ *   WAKE (Vosk, wake grammar) → hears "hey atlas" → LISTENING (Vosk, free STT)
+ *   → THINKING (shared agent loop) → SPEAKING (TTS) → back to WAKE.
  *
- * Fail-soft: if the Picovoice key, the "Hey Atlas" keyword, or the Vosk model are
- * missing, it posts an ERROR status (surfaced in the UI) and stops — the rest of the app
- * is unaffected. See docs/VOICE_SETUP.md.
+ * The wake listener is stopped while capturing the command and while ATLAS talks, so a
+ * single mic is never contended and it won't trigger on its own voice. Fail-soft: if the
+ * Vosk model assets are missing it reports the gap and stops; the rest of the app works.
+ * See docs/VOICE_SETUP.md.
  */
 class VoiceService : Service() {
 
@@ -41,11 +42,10 @@ class VoiceService : Service() {
     private lateinit var container: AtlasContainer
 
     private var tts: Tts? = null
-    private var wake: WakeWord? = null
     private var stt: VoskStt? = null
 
     private val history = ArrayList<LlmMessage>()
-    private var busy = false
+    @Volatile private var busy = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -54,72 +54,63 @@ class VoiceService : Service() {
         container = (application as AtlasApp).container
         Notifications.ensureChannel(this)
         startForegroundCompat("Starting…")
-        VoiceStatus.set(VoicePhase.WAKE, "Starting…")
+        setPhase(VoicePhase.WAKE, "Starting…")
 
         tts = Tts(this)
 
-        // Load the Vosk model from assets (unpacks once into app storage), then start
-        // the wake word. If the model assets are missing, report the setup gap.
         StorageService.unpack(
             this, VOSK_ASSET_DIR, "vosk",
             { model: Model ->
                 stt = VoskStt(model)
-                startWake()
+                listenForWake()
             },
-            { e ->
-                fail("Speech model missing — see VOICE_SETUP (${e.message})")
-            },
+            { e -> fail("Speech model missing — see VOICE_SETUP (${e.message})") },
         )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
-    private fun startWake() {
-        val key = container.secrets.picovoiceAccessKey
-        if (key.isNullOrBlank()) {
-            fail("No Picovoice AccessKey — add it in Settings.")
-            return
-        }
-        if (!Assets.exists(this, KEYWORD_ASSET)) {
-            fail("\"Hey Atlas\" keyword missing — see VOICE_SETUP.")
-            return
-        }
-        val ppn = Assets.copyFile(this, KEYWORD_ASSET, "Hey-Atlas.ppn").absolutePath
-        val w = WakeWord(this, key, ppn) { onWake() }
-        if (!w.build()) {
-            fail("Wake word failed to start (check AccessKey / keyword).")
-            return
-        }
-        wake = w
-        w.resume()
-        setPhase(VoicePhase.WAKE, "Listening for “Hey Atlas”")
+    /** Phase 1: low-effort keyword spotting for "hey atlas". */
+    private fun listenForWake() {
+        val engine = stt ?: return
+        setPhase(VoicePhase.WAKE, "Say “Hey Atlas”")
+        engine.start(
+            grammar = VoskStt.WAKE_GRAMMAR,
+            onPartial = { if (matchesWake(it)) onWake() },
+            onResult = { if (matchesWake(it)) onWake() },
+            onError = { fail(it) },
+        )
     }
 
-    /** Porcupine callback (its own thread) — hop to the service scope. */
+    private fun matchesWake(text: String): Boolean = text.contains("atlas", ignoreCase = true)
+
+    /** Called from Vosk's thread; guard against duplicate triggers, then run one turn. */
     private fun onWake() {
+        if (busy) return
+        busy = true
         scope.launch { runTurn() }
     }
 
     private suspend fun runTurn() {
-        if (busy) return
-        busy = true
         try {
-            wake?.pause()                       // free the mic for STT
+            stt?.stop()                          // stop the wake listener, free the mic
             setPhase(VoicePhase.LISTENING, "Listening…")
 
-            val sttEngine = stt ?: return
+            val engine = stt ?: return
             val text = withTimeoutOrNull(LISTEN_TIMEOUT_MS) {
                 suspendCancellableCoroutine { c ->
-                    sttEngine.listen(
-                        onFinal = { if (c.isActive) c.resume(it) },
+                    engine.start(
+                        grammar = null,
+                        onPartial = {},
+                        onResult = { if (c.isActive) c.resume(it) },
                         onError = { if (c.isActive) c.resume("") },
                     )
-                    c.invokeOnCancellation { sttEngine.stop() }
+                    c.invokeOnCancellation { engine.stop() }
                 }
             }.orEmpty()
-            sttEngine.stop()
+            engine.stop()
 
-            if (text.isBlank()) return          // nothing heard → back to wake
+            if (text.isBlank()) return
 
             setPhase(VoicePhase.THINKING, text)
             val answer = think(text)
@@ -128,8 +119,7 @@ class VoiceService : Service() {
             tts?.speak(answer.ifBlank { "Sorry, I didn't catch that." })
         } finally {
             busy = false
-            wake?.resume()
-            setPhase(VoicePhase.WAKE, "Listening for “Hey Atlas”")
+            listenForWake()                      // resume wake listening
         }
     }
 
@@ -150,9 +140,7 @@ class VoiceService : Service() {
         return answer
     }
 
-    private fun fail(message: String) {
-        setPhase(VoicePhase.ERROR, message)
-    }
+    private fun fail(message: String) = setPhase(VoicePhase.ERROR, message)
 
     private fun setPhase(phase: VoicePhase, detail: String) {
         VoiceStatus.set(phase, detail)
@@ -171,7 +159,6 @@ class VoiceService : Service() {
     }
 
     override fun onDestroy() {
-        wake?.release()
         stt?.stop()
         tts?.stop()
         tts?.shutdown()
@@ -185,6 +172,5 @@ class VoiceService : Service() {
         private const val LISTEN_TIMEOUT_MS = 12_000L
         private const val MAX_HISTORY = 8
         private const val VOSK_ASSET_DIR = "vosk-model"
-        private const val KEYWORD_ASSET = "porcupine/Hey-Atlas.ppn"
     }
 }

@@ -40,8 +40,7 @@ mobile/app/src/main/assets/minilm/*.onnx
 mobile/app/src/main/assets/minilm/vocab.txt
 mobile/app/src/main/assets/genie/*.bin
 mobile/app/src/main/assets/genie/*.serialized
-# Voice (M3): wake-word keyword + Vosk model (per-device, large)
-mobile/app/src/main/assets/porcupine/*.ppn
+# Voice (M3): Vosk model (per-device, large)
 mobile/app/src/main/assets/vosk-model/**
 !mobile/app/src/main/assets/vosk-model/README.txt
 

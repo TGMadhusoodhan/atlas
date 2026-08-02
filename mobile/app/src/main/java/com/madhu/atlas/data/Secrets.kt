@@ -29,11 +29,6 @@ class Secrets(context: Context) {
         get() = decrypt(prefs.getString(KEY_DEEPSEEK, null))?.takeIf { it.isNotBlank() }
         set(value) = put(KEY_DEEPSEEK, value)
 
-    /** Picovoice AccessKey for the "Hey Atlas" wake word (free from console.picovoice.ai). */
-    var picovoiceAccessKey: String?
-        get() = decrypt(prefs.getString(KEY_PICOVOICE, null))?.takeIf { it.isNotBlank() }
-        set(value) = put(KEY_PICOVOICE, value)
-
     private fun put(key: String, value: String?) {
         prefs.edit().apply {
             if (value.isNullOrBlank()) remove(key) else putString(key, encrypt(value.trim()))
@@ -87,7 +82,6 @@ class Secrets(context: Context) {
 
     private companion object {
         const val KEY_DEEPSEEK = "deepseek_api_key"
-        const val KEY_PICOVOICE = "picovoice_access_key"
         const val KEYSTORE = "AndroidKeyStore"
         const val ALIAS = "atlas_secret_key"
         const val TRANSFORM = "AES/GCM/NoPadding"
