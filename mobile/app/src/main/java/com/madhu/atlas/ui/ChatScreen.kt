@@ -41,19 +41,45 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicNone
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.madhu.atlas.chat.ChatMessage
 import com.madhu.atlas.chat.Sender
+import com.madhu.atlas.voice.VoicePhase
+import com.madhu.atlas.voice.VoiceStatus
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val voicePhase by VoiceStatus.phase.collectAsStateWithLifecycle()
+    val voiceDetail by VoiceStatus.detail.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     var showSettings by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+
+    val micPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> if (granted) viewModel.startVoice() }
+
+    fun toggleVoice() {
+        if (voicePhase == VoicePhase.OFF) {
+            val granted = ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (granted) viewModel.startVoice() else micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+        } else {
+            viewModel.stopVoice()
+        }
+    }
 
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.lastIndex)
@@ -63,8 +89,10 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
         SettingsDialog(
             onlineEnabled = state.onlineEnabled,
             hasApiKey = state.hasApiKey,
+            hasPicovoiceKey = state.hasPicovoiceKey,
             onToggleOnline = viewModel::setOnline,
             onSaveKey = viewModel::saveApiKey,
+            onSavePicovoiceKey = viewModel::savePicovoiceKey,
             onDismiss = { showSettings = false },
         )
     }
@@ -80,14 +108,24 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
                     Column {
                         Text("ATLAS", fontWeight = FontWeight.Bold)
                         val sub = when {
+                            voicePhase != VoicePhase.OFF ->
+                                "🎙 ${voicePhase.name.lowercase()}" + if (voiceDetail.isNotBlank()) " · $voiceDetail" else ""
                             state.generating && state.engine != null -> "thinking · ${state.engine}"
                             state.engine != null -> "ready · ${state.engine}"
                             else -> "Always There, Listening And Serving"
                         }
-                        Text(sub, style = MaterialTheme.typography.labelSmall)
+                        Text(sub, style = MaterialTheme.typography.labelSmall, maxLines = 1)
                     }
                 },
                 actions = {
+                    val voiceOn = voicePhase != VoicePhase.OFF
+                    IconButton(onClick = { toggleVoice() }) {
+                        Icon(
+                            if (voiceOn) Icons.Filled.Mic else Icons.Filled.MicNone,
+                            contentDescription = if (voiceOn) "Stop voice" else "Start \"Hey Atlas\"",
+                            tint = if (voiceOn) MaterialTheme.colorScheme.primary else Color.Unspecified,
+                        )
+                    }
                     IconButton(onClick = { showSettings = true }) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }
@@ -179,11 +217,14 @@ private fun InputBar(
 private fun SettingsDialog(
     onlineEnabled: Boolean,
     hasApiKey: Boolean,
+    hasPicovoiceKey: Boolean,
     onToggleOnline: (Boolean) -> Unit,
     onSaveKey: (String) -> Unit,
+    onSavePicovoiceKey: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var key by remember { mutableStateOf("") }
+    var pvKey by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Settings") },
@@ -206,7 +247,19 @@ private fun SettingsDialog(
                     singleLine = true,
                 )
                 Text(
-                    "Off / no key / offline → ATLAS answers fully on-device.",
+                    if (hasPicovoiceKey) "Picovoice key (Hey Atlas): saved" else "Picovoice key (Hey Atlas): not set",
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+                OutlinedTextField(
+                    value = pvKey,
+                    onValueChange = { pvKey = it },
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    placeholder = { Text("Paste Picovoice AccessKey") },
+                    singleLine = true,
+                )
+                Text(
+                    "Voice needs the Picovoice key + the Hey-Atlas keyword & Vosk model assets (see VOICE_SETUP).",
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier.padding(top = 8.dp),
                 )
@@ -215,6 +268,7 @@ private fun SettingsDialog(
         confirmButton = {
             TextButton(onClick = {
                 if (key.isNotBlank()) onSaveKey(key.trim())
+                if (pvKey.isNotBlank()) onSavePicovoiceKey(pvKey.trim())
                 onDismiss()
             }) { Text("Save") }
         },

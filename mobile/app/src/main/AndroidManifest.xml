@@ -7,6 +7,11 @@
 
     <!-- Reminders post notifications (runtime-requested on Android 13+). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Voice (M3): "Hey Atlas" wake word + speech recognition. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <!-- No CALL_PHONE / CAMERA: dial_number uses ACTION_DIAL and take_photo uses the
          camera app, so ATLAS never needs those sensitive permissions. -->
 
@@ -49,5 +54,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Always-listening "Hey Atlas" pipeline. Microphone foreground service so
+             it can keep the wake word running with the app backgrounded. -->
+        <service
+            android:name=".voice.VoiceService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 </manifest>

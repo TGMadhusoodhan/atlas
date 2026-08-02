@@ -1,10 +1,13 @@
 package com.madhu.atlas.ui
 
 import android.app.Application
+import android.content.Intent
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.madhu.atlas.AtlasApp
 import com.madhu.atlas.agent.AgentEvent
+import com.madhu.atlas.voice.VoiceService
 import com.madhu.atlas.chat.ChatMessage
 import com.madhu.atlas.chat.Sender
 import com.madhu.atlas.llm.LlmMessage
@@ -27,6 +30,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val error: String? = null,
         val onlineEnabled: Boolean = true,
         val hasApiKey: Boolean = false,
+        val hasPicovoiceKey: Boolean = false,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -36,7 +40,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var nextId = 1L
 
     init {
-        _state.update { it.copy(hasApiKey = container.secrets.deepSeekApiKey != null) }
+        _state.update {
+            it.copy(
+                hasApiKey = container.secrets.deepSeekApiKey != null,
+                hasPicovoiceKey = container.secrets.picovoiceAccessKey != null,
+            )
+        }
         viewModelScope.launch {
             container.settings.onlineEnabled.collect { on ->
                 _state.update { it.copy(onlineEnabled = on) }
@@ -49,8 +58,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(hasApiKey = container.secrets.deepSeekApiKey != null) }
     }
 
+    fun savePicovoiceKey(key: String) {
+        container.secrets.picovoiceAccessKey = key
+        _state.update { it.copy(hasPicovoiceKey = container.secrets.picovoiceAccessKey != null) }
+    }
+
     fun setOnline(enabled: Boolean) {
         viewModelScope.launch { container.settings.setOnlineEnabled(enabled) }
+    }
+
+    fun startVoice() {
+        val ctx = getApplication<Application>()
+        ContextCompat.startForegroundService(ctx, Intent(ctx, VoiceService::class.java))
+    }
+
+    fun stopVoice() {
+        val ctx = getApplication<Application>()
+        ctx.stopService(Intent(ctx, VoiceService::class.java))
     }
 
     fun send(text: String) {
