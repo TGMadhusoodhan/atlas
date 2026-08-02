@@ -19,9 +19,10 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.vosk.Model
-import org.vosk.android.StorageService
+import java.io.File
 import kotlin.coroutines.resume
 
 /**
@@ -58,14 +59,40 @@ class VoiceService : Service() {
 
         tts = Tts(this)
 
-        StorageService.unpack(
-            this, VOSK_ASSET_DIR, "vosk",
-            { model: Model ->
+        // Copy the bundled Vosk model to app storage once (off the main thread), then
+        // load it. Done manually rather than via Vosk's StorageService.unpack, which
+        // requires a "uuid" file the published models don't ship.
+        scope.launch {
+            val model = withContext(Dispatchers.IO) { runCatching { ensureModel() }.getOrNull() }
+            if (model == null) {
+                fail("Speech model missing — add assets/vosk-model (see VOICE_SETUP).")
+            } else {
                 stt = VoskStt(model)
                 listenForWake()
-            },
-            { e -> fail("Speech model missing — see VOICE_SETUP (${e.message})") },
-        )
+            }
+        }
+    }
+
+    /** Ensure the model is unpacked into app storage and return a loaded [Model]. */
+    private fun ensureModel(): Model {
+        val dir = File(filesDir, VOSK_ASSET_DIR)
+        if (!File(dir, "am/final.mdl").exists()) {   // not yet copied (or partial)
+            dir.deleteRecursively()
+            copyAssetDir(VOSK_ASSET_DIR, dir)
+        }
+        return Model(dir.absolutePath)
+    }
+
+    /** Recursively copy an assets directory tree to [outFile]. */
+    private fun copyAssetDir(assetPath: String, outFile: File) {
+        val children = assets.list(assetPath) ?: emptyArray()
+        if (children.isEmpty()) {                    // leaf → it's a file
+            outFile.parentFile?.mkdirs()
+            assets.open(assetPath).use { input -> outFile.outputStream().use { input.copyTo(it) } }
+        } else {
+            outFile.mkdirs()
+            for (child in children) copyAssetDir("$assetPath/$child", File(outFile, child))
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
