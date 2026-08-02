@@ -104,8 +104,8 @@ dependencies {
     // libonnxruntime4j_jni.so was only 4 KB-aligned and would fail to load there.
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0")
 
-    // Security: encrypted key storage + biometric app-lock
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // Security: biometric app-lock (secret encryption uses the Android Keystore
+    // directly in data/Secrets.kt — no Jetpack Security dependency).
     implementation("androidx.biometric:biometric:1.1.0")
 
     // DataStore for lightweight settings
