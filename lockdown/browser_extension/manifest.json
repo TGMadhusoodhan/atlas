@@ -1,0 +1,11 @@
+{
+  "manifest_version": 2,
+  "name": "AI Focus Lockdown",
+  "version": "1.0",
+  "description": "Enforces browser domain restrictions during ai-sidebar focus sessions.",
+  "permissions": ["tabs", "webNavigation"],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  }
+}

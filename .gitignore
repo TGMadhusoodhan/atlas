@@ -1,0 +1,45 @@
+# ── Secrets — never commit ──────────────────────────────────────────────
+.env
+*.env
+config.toml
+*.token
+*.key
+*.pem
+telegram.json
+*.session
+.wwebjs_auth/
+.wwebjs_cache/
+
+# ── Python (desktop helpers) ────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ── Node (if any tooling is re-added) ───────────────────────────────────
+node_modules/
+npm-debug.log*
+
+# ── Quickshell ──────────────────────────────────────────────────────────
+.qs/
+
+# ── Android app (mobile/) ───────────────────────────────────────────────
+mobile/.gradle/
+mobile/build/
+mobile/app/build/
+mobile/captures/
+mobile/local.properties
+mobile/.cxx/
+mobile/.externalNativeBuild/
+**/*.iml
+.idea/
+
+# Large on-device model assets (not distributed in the repo)
+mobile/app/src/main/assets/minilm/*.onnx
+mobile/app/src/main/assets/minilm/vocab.txt
+mobile/app/src/main/assets/genie/*.bin
+mobile/app/src/main/assets/genie/*.serialized
+
+# ── OS ──────────────────────────────────────────────────────────────────
+.DS_Store

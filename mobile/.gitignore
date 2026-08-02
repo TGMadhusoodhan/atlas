@@ -1,0 +1,16 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx/
+local.properties
+
+# Large model assets are not committed — see docs and asset READMEs.
+app/src/main/assets/minilm/*.onnx
+app/src/main/assets/minilm/vocab.txt
+app/src/main/assets/genie/*.bin
+app/src/main/assets/genie/*.serialized

@@ -1,0 +1,7 @@
+singleton Theme 1.0 Theme.qml
+Sidebar 1.0 Sidebar.qml
+ChatView 1.0 ChatView.qml
+MessageItem 1.0 MessageItem.qml
+InputBar 1.0 InputBar.qml
+ModelPicker 1.0 ModelPicker.qml
+StatusIndicator 1.0 StatusIndicator.qml

@@ -1,0 +1,12 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: ai-sidebar-searxng
+    ports:
+      # Bind to loopback only — never expose the search engine to the LAN.
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_SECRET_KEY=${SEARXNG_SECRET_KEY:-ai-sidebar-local-dev-secret-change-me}
+    restart: always

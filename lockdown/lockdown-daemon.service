@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Sidebar Lockdown Daemon
+Documentation=file://%h/ai-sidebar/lockdown/README.md
+After=graphical-session.target hyprland-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/MadhuArch/ai-sidebar/venv/bin/python /home/MadhuArch/ai-sidebar/lockdown/daemon.py
+Restart=on-failure
+RestartSec=5
+
+# Inherit Hyprland env — requires running this in hyprland.conf first:
+#   exec-once = systemctl --user import-environment HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY
+PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_RUNTIME_DIR DISPLAY
+
+[Install]
+WantedBy=graphical-session.target

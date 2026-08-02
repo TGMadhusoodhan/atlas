@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose owns the real theming (AtlasTheme). This XML theme only sets the
+         window chrome before the first frame. NoActionBar + edge-to-edge friendly. -->
+    <style name="Theme.Atlas" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/atlas_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>
