@@ -98,8 +98,11 @@ dependencies {
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
 
-    // On-device embeddings: ONNX Runtime Mobile (all-MiniLM-L6-v2)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+    // On-device embeddings: ONNX Runtime Mobile (all-MiniLM-L6-v2).
+    // 1.28.0+ ships 16 KB-page-aligned native libs (required for Android 15 / the
+    // Snapdragon 8 Elite Gen 5, which boots with 16 KB memory pages). 1.20.0's
+    // libonnxruntime4j_jni.so was only 4 KB-aligned and would fail to load there.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0")
 
     // Security: encrypted key storage + biometric app-lock
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
