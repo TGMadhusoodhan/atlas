@@ -6,7 +6,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -65,6 +70,10 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
     }
 
     Scaffold(
+        // TopAppBar handles the status-bar inset itself; we zero the Scaffold's content
+        // insets so the input bar can own the bottom (IME ∪ navigation bar) with no
+        // double-padding. Fixes the keyboard covering the message box (edge-to-edge).
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
                 title = {
@@ -98,6 +107,9 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
                 generating = state.generating,
                 onSend = viewModel::send,
                 onStop = viewModel::stop,
+                modifier = Modifier.windowInsetsPadding(
+                    WindowInsets.ime.union(WindowInsets.navigationBars)
+                ),
             )
         }
     }
@@ -125,10 +137,15 @@ private fun MessageBubble(msg: ChatMessage) {
 }
 
 @Composable
-private fun InputBar(generating: Boolean, onSend: (String) -> Unit, onStop: () -> Unit) {
+private fun InputBar(
+    generating: Boolean,
+    onSend: (String) -> Unit,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     var text by remember { mutableStateOf("") }
     Row(
-        Modifier.fillMaxWidth().padding(8.dp),
+        modifier.fillMaxWidth().padding(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         OutlinedTextField(
