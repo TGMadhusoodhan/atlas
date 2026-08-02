@@ -1,27 +1,21 @@
 package com.madhu.atlas.memory
 
-import io.objectbox.annotation.Entity
-import io.objectbox.annotation.HnswIndex
-import io.objectbox.annotation.Id
-import io.objectbox.annotation.Index
-import io.objectbox.annotation.VectorDistanceType
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.PrimaryKey
 
 /**
- * One stored memory: a conversation snippet plus its 384-d embedding, indexed for
- * on-device approximate nearest-neighbour search (HNSW, cosine). Cosine distance here
- * matches the desktop Chroma space, so the 0.85 relevance gate carries over.
+ * One stored memory: a conversation snippet plus its 384-d embedding. Cosine similarity
+ * is computed in Kotlin over these rows (see [MemoryStore]) — at personal-assistant
+ * volume a brute-force scan is sub-millisecond, so no vector index is needed.
+ * Embeddings are L2-normalised by [Embedder], so cosine distance = 1 − dot product.
  */
-@Entity
-class MemoryEntity(
-    @Id var id: Long = 0,
-
-    /** SHA-1 of the text — used to deduplicate identical memories (see [MemoryStore.add]). */
-    @Index var contentHash: String = "",
-
-    var text: String = "",
-    var source: String = "chat",
-    var timestamp: Long = 0,
-
-    @HnswIndex(dimensions = Embedder.DIM, distanceType = VectorDistanceType.COSINE)
-    var embedding: FloatArray = FloatArray(0),
+@Entity(tableName = "memories", indices = [Index(value = ["contentHash"], unique = true)])
+data class MemoryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val contentHash: String = "",
+    val text: String = "",
+    val source: String = "chat",
+    val timestamp: Long = 0,
+    val embedding: FloatArray = FloatArray(0),
 )

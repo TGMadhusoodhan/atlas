@@ -3,7 +3,6 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
-    id("io.objectbox")
 }
 
 android {
@@ -94,12 +93,10 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
-    // Room — structured profile facts
+    // Room — profile facts + semantic-memory vectors (brute-force cosine)
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
-
-    // ObjectBox vectors is applied via the io.objectbox plugin (adds its deps)
 
     // On-device embeddings: ONNX Runtime Mobile (all-MiniLM-L6-v2)
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")

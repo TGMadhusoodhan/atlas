@@ -15,7 +15,6 @@ import com.madhu.atlas.llm.EngineRouter
 import com.madhu.atlas.llm.LlmEngine
 import com.madhu.atlas.memory.Embedder
 import com.madhu.atlas.memory.MemoryStore
-import com.madhu.atlas.memory.MyObjectBox
 import com.madhu.atlas.profile.AtlasDatabase
 import com.madhu.atlas.profile.ProfileStore
 
@@ -41,16 +40,17 @@ class AtlasContainer(context: Context) {
     val settings = SettingsStore(appContext)
     private val connectivity = Connectivity(appContext)
 
+    private val db = AtlasDatabase.get(appContext)
+
     // Semantic memory. Embedder needs the MiniLM assets; if absent, memory runs
     // disabled (embedder = null) and chat is unaffected — same fail-soft as desktop.
-    private val boxStore = MyObjectBox.builder().androidContext(appContext).build()
     private val embedder: Embedder? = runCatching { Embedder.create(appContext) }
         .onFailure { Log.w("ATLAS", "Embedder unavailable — memory disabled: ${it.message}") }
         .getOrNull()
-    val memory = MemoryStore.create(boxStore, embedder)
+    val memory = MemoryStore.create(db.memoryDao(), embedder)
 
     // Long-term profile facts.
-    private val profile = ProfileStore(AtlasDatabase.get(appContext).profileDao())
+    private val profile = ProfileStore(db.profileDao())
 
     // Engines: Echo is the offline placeholder until GenieEngine (NPU) is wired in M1 step 5.
     private val local: LlmEngine = EchoEngine()

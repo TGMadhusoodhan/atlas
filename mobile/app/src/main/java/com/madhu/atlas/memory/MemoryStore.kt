@@ -1,9 +1,5 @@
 package com.madhu.atlas.memory
 
-import io.objectbox.Box
-import io.objectbox.BoxStore
-import io.objectbox.kotlin.query
-import io.objectbox.query.QueryBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.security.MessageDigest
@@ -11,12 +7,15 @@ import java.security.MessageDigest
 /**
  * Semantic long-term memory, the mobile port of `helper/vectordb.py`. Stores every
  * finished exchange, recalls by *meaning* (not recency), and can forget. Fails soft:
- * if embedding/store init failed, all ops no-op and chat is unaffected.
+ * if the embedder is unavailable, all ops no-op and chat is unaffected.
  *
- * API mirrors the desktop: add / search / delete / clear / count.
+ * Backed by Room with an in-Kotlin brute-force cosine scan — embeddings are
+ * L2-normalised, so cosine distance = 1 − dot product. At personal-assistant volume
+ * this is sub-millisecond and needs no vector index. API mirrors the desktop:
+ * add / search / delete / clear / count.
  */
 class MemoryStore(
-    private val box: Box<MemoryEntity>,
+    private val dao: MemoryDao,
     private val embedder: Embedder?,
 ) {
     data class Hit(val id: Long, val text: String, val distance: Double, val source: String)
@@ -27,11 +26,9 @@ class MemoryStore(
         if (clean.length < 8 || embedder == null) return@withContext
         runCatching {
             val hash = sha1(clean)
-            val existing = box.query { equal(MemoryEntity_.contentHash, hash, QueryBuilder.StringOrder.CASE_SENSITIVE) }
-                .use { it.findFirst() }
-            if (existing != null) return@runCatching
+            if (dao.byHash(hash) != null) return@runCatching
             val vec = embedder.embed(clean)
-            box.put(
+            dao.insert(
                 MemoryEntity(
                     contentHash = hash,
                     text = clean,
@@ -55,18 +52,21 @@ class MemoryStore(
         val clean = query.trim()
         if (clean.isEmpty() || embedder == null) return@withContext emptyList()
         runCatching {
-            val vec = embedder.embed(clean)
-            box.query(MemoryEntity_.embedding.nearestNeighbors(vec, k)).build().use { q ->
-                q.findWithScores()
-                    .filter { it.score <= maxDistance }
-                    .map { Hit(it.get().id, it.get().text, it.score, it.get().source) }
-            }
+            val q = embedder.embed(clean)
+            dao.all()
+                .asSequence()
+                .filter { it.embedding.size == q.size }
+                .map { row -> Hit(row.id, row.text, cosineDistance(q, row.embedding), row.source) }
+                .filter { it.distance <= maxDistance }
+                .sortedBy { it.distance }
+                .take(k)
+                .toList()
         }.getOrElse { emptyList() }
     }
 
     suspend fun delete(ids: List<Long>): Int = withContext(Dispatchers.Default) {
         if (ids.isEmpty()) return@withContext 0
-        runCatching { box.remove(ids); ids.size }.getOrDefault(0)
+        runCatching { dao.deleteByIds(ids); ids.size }.getOrDefault(0)
     }
 
     /** Forget memories matching [query] above the relevance gate. Returns removed texts. */
@@ -78,17 +78,24 @@ class MemoryStore(
         }
 
     suspend fun clear(): Long = withContext(Dispatchers.Default) {
-        runCatching { val n = box.count(); box.removeAll(); n }.getOrDefault(0L)
+        runCatching { val n = dao.count(); dao.clear(); n }.getOrDefault(0L)
     }
 
-    fun count(): Long = runCatching { box.count() }.getOrDefault(0L)
+    suspend fun count(): Long = runCatching { dao.count() }.getOrDefault(0L)
+
+    /** 1 − cosine similarity. Assumes both vectors are L2-normalised (Embedder guarantees). */
+    private fun cosineDistance(a: FloatArray, b: FloatArray): Double {
+        var dot = 0.0
+        for (i in a.indices) dot += a[i] * b[i]
+        return 1.0 - dot
+    }
 
     private fun sha1(s: String): String =
         MessageDigest.getInstance("SHA-1").digest(s.toByteArray())
             .joinToString("") { "%02x".format(it) }
 
     companion object {
-        fun create(store: BoxStore, embedder: Embedder?): MemoryStore =
-            MemoryStore(store.boxFor(MemoryEntity::class.java), embedder)
+        fun create(dao: MemoryDao, embedder: Embedder?): MemoryStore =
+            MemoryStore(dao, embedder)
     }
 }
