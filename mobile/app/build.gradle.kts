@@ -111,6 +111,9 @@ dependencies {
     // DataStore for lightweight settings
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
+    // WorkManager — schedules reminder notifications
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("androidx.compose.ui:ui-tooling-preview")
 

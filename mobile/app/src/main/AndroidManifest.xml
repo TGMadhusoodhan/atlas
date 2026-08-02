@@ -5,12 +5,30 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- M2 tool permissions (declared now, requested at runtime when first used) -->
-    <uses-permission android:name="android.permission.CALL_PHONE" />
-    <uses-permission
-        android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- CAMERA is not required for ACTION_IMAGE_CAPTURE (the camera app owns it),
-         so it is intentionally omitted to keep the permission surface minimal. -->
+    <!-- Reminders post notifications (runtime-requested on Android 13+). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- No CALL_PHONE / CAMERA: dial_number uses ACTION_DIAL and take_photo uses the
+         camera app, so ATLAS never needs those sensitive permissions. -->
+
+    <!-- Package visibility (Android 11+): lets open_app enumerate launchable apps and
+         lets the tools resolve dialer / mail / browser / camera handlers. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="mailto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
 
     <application
         android:name=".AtlasApp"

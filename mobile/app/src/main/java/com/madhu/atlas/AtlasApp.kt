@@ -17,6 +17,8 @@ import com.madhu.atlas.memory.Embedder
 import com.madhu.atlas.memory.MemoryStore
 import com.madhu.atlas.profile.AtlasDatabase
 import com.madhu.atlas.profile.ProfileStore
+import com.madhu.atlas.tools.Notifications
+import com.madhu.atlas.tools.deviceTools
 
 class AtlasApp : Application() {
     lateinit var container: AtlasContainer
@@ -24,6 +26,7 @@ class AtlasApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        Notifications.ensureChannel(this)
         container = AtlasContainer(this)
     }
 }
@@ -57,7 +60,7 @@ class AtlasContainer(context: Context) {
     private val online: LlmEngine = DeepSeekEngine(apiKeyProvider = { secrets.deepSeekApiKey })
     private val router = EngineRouter(local, online, connectivity, settings)
 
-    // The reused agent core. Tool registry is empty in M1 (tools arrive in M2).
+    // The reused agent core, now with the M2 device toolset.
     private val systemPrompt = SystemPrompt(profile, memory)
-    val agentLoop = AgentLoop(router, systemPrompt, ToolRegistry(), memory)
+    val agentLoop = AgentLoop(router, systemPrompt, ToolRegistry(deviceTools(appContext)), memory)
 }
