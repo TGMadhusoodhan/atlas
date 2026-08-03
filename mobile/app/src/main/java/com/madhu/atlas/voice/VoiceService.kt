@@ -44,9 +44,13 @@ class VoiceService : Service() {
 
     private var tts: Tts? = null
     private var stt: VoskStt? = null
+    private val androidStt by lazy { AndroidStt(this) }
 
     private val history = ArrayList<LlmMessage>()
     @Volatile private var busy = false
+
+    /** Cleared in [onDestroy] so a tear-down never re-arms the mic (fixes stop-button). */
+    @Volatile private var alive = true
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -97,8 +101,15 @@ class VoiceService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
+    /** Always-on: if the user swipes the app away, keep the wake service running. */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (alive) runCatching { startForegroundService(Intent(this, VoiceService::class.java)) }
+        super.onTaskRemoved(rootIntent)
+    }
+
     /** Phase 1: low-effort keyword spotting for "hey atlas". */
     private fun listenForWake() {
+        if (!alive) return                       // service is being torn down — don't re-arm
         val engine = stt ?: return
         setPhase(VoicePhase.WAKE, "Say “Hey Atlas”")
         engine.start(
@@ -109,6 +120,12 @@ class VoiceService : Service() {
         )
     }
 
+    /**
+     * The wake grammar already restricts the vocabulary, so a lenient match on "atlas"
+     * reliably catches "hey atlas" without demanding a perfect transcription from the
+     * tiny model. The wake word is the "I'm talking to you" signal — one wake opens a
+     * whole conversation (see [runTurn]).
+     */
     private fun matchesWake(text: String): Boolean = text.contains("atlas", ignoreCase = true)
 
     /** Called from Vosk's thread; guard against duplicate triggers, then run one turn. */
@@ -118,36 +135,78 @@ class VoiceService : Service() {
         scope.launch { runTurn() }
     }
 
+    /**
+     * One wake opens a whole conversation: keep listening and serving, answering each
+     * thing said with no need to repeat "Hey Atlas". A short stretch of silence ends the
+     * session and returns to the wake word. "Always There, Listening And Serving."
+     */
     private suspend fun runTurn() {
         try {
             stt?.stop()                          // stop the wake listener, free the mic
-            setPhase(VoicePhase.LISTENING, "Listening…")
-
-            val engine = stt ?: return
-            val text = withTimeoutOrNull(LISTEN_TIMEOUT_MS) {
-                suspendCancellableCoroutine { c ->
-                    engine.start(
-                        grammar = null,
-                        onPartial = {},
-                        onResult = { if (c.isActive) c.resume(it) },
-                        onError = { if (c.isActive) c.resume("") },
-                    )
-                    c.invokeOnCancellation { engine.stop() }
-                }
-            }.orEmpty()
-            engine.stop()
-
-            if (text.isBlank()) return
-
-            setPhase(VoicePhase.THINKING, text)
-            val answer = think(text)
-
-            setPhase(VoicePhase.SPEAKING, answer)
-            tts?.speak(answer.ifBlank { "Sorry, I didn't catch that." })
+            while (alive) {
+                setPhase(VoicePhase.LISTENING, "Listening…")
+                val text = capture()
+                if (text.isBlank()) break        // silence → end the session
+                respond(text)
+            }
         } finally {
             busy = false
-            listenForWake()                      // resume wake listening
+            listenForWake()                      // back to sleep / wake word (no-op if !alive)
         }
+    }
+
+    /**
+     * Capture one spoken utterance (grammar off). Returns "" on silence/error so the
+     * caller can end the session. Distinguishes *silence* from *still speaking*: a
+     * watchdog gives up only if no speech has started within [NO_SPEECH_TIMEOUT_MS];
+     * once the speaker begins, it waits for Vosk's endpointed final result so a late or
+     * long sentence is never cut off (bounded by [MAX_UTTERANCE_MS]).
+     */
+    private suspend fun capture(): String {
+        // Prefer Google's recognizer for accurate command dictation (on-device if
+        // available); fall back to Vosk so voice still works fully offline.
+        if (androidStt.available()) {
+            val text = withTimeoutOrNull(MAX_UTTERANCE_MS) { androidStt.listen() }.orEmpty()
+            return text.trim()
+        }
+        return captureVosk()
+    }
+
+    /** Fully-offline command capture via Vosk, with speech-start/silence detection. */
+    private suspend fun captureVosk(): String {
+        val engine = stt ?: return ""
+        val text = withTimeoutOrNull(MAX_UTTERANCE_MS) {
+            suspendCancellableCoroutine { c ->
+                val speechStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+                val done = java.util.concurrent.atomic.AtomicBoolean(false)
+                // Vosk callbacks and the watchdog run on different threads — only the
+                // first one to finish may resume the continuation.
+                fun finish(result: String) {
+                    if (done.compareAndSet(false, true) && c.isActive) c.resume(result)
+                }
+                val watchdog = scope.launch {
+                    kotlinx.coroutines.delay(NO_SPEECH_TIMEOUT_MS)
+                    if (!speechStarted.get()) finish("")   // silence → end the session
+                }
+                engine.start(
+                    grammar = null,
+                    onPartial = { if (it.isNotBlank()) speechStarted.set(true) },
+                    onResult = { watchdog.cancel(); finish(it) },
+                    onError = { watchdog.cancel(); finish("") },
+                )
+                c.invokeOnCancellation { watchdog.cancel(); engine.stop() }
+            }
+        }.orEmpty()
+        engine.stop()
+        return text.trim()
+    }
+
+    /** Think + speak one directed utterance. */
+    private suspend fun respond(text: String) {
+        setPhase(VoicePhase.THINKING, text)
+        val answer = think(text)
+        setPhase(VoicePhase.SPEAKING, answer)
+        tts?.speak(answer.ifBlank { "Sorry, I didn't catch that." })
     }
 
     /** Run the shared agent loop for one spoken command and return the spoken reply. */
@@ -186,17 +245,19 @@ class VoiceService : Service() {
     }
 
     override fun onDestroy() {
+        alive = false                            // before anything else — block re-arming
+        scope.cancel()
         stt?.stop()
         tts?.stop()
         tts?.shutdown()
-        scope.cancel()
         VoiceStatus.set(VoicePhase.OFF)
         super.onDestroy()
     }
 
     companion object {
         private const val NOTIF_ID = 42
-        private const val LISTEN_TIMEOUT_MS = 12_000L
+        private const val NO_SPEECH_TIMEOUT_MS = 8_000L   // silence before it sleeps
+        private const val MAX_UTTERANCE_MS = 15_000L      // hard cap on one spoken turn
         private const val MAX_HISTORY = 8
         private const val VOSK_ASSET_DIR = "vosk-model"
     }

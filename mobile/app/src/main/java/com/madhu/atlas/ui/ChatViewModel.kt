@@ -30,6 +30,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val error: String? = null,
         val onlineEnabled: Boolean = true,
         val hasApiKey: Boolean = false,
+        val alwaysListening: Boolean = true,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -44,6 +45,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             container.settings.onlineEnabled.collect { on ->
                 _state.update { it.copy(onlineEnabled = on) }
             }
+        }
+        viewModelScope.launch {
+            container.settings.alwaysListening.collect { on ->
+                _state.update { it.copy(alwaysListening = on) }
+            }
+        }
+    }
+
+    fun setAlwaysListening(enabled: Boolean) {
+        viewModelScope.launch {
+            container.settings.setAlwaysListening(enabled)
+            if (enabled) startVoice() else stopVoice()
         }
     }
 

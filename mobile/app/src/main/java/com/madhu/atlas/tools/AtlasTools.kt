@@ -20,6 +20,8 @@ import androidx.work.workDataOf
 import com.madhu.atlas.agent.Tool
 import com.madhu.atlas.agent.ToolResult
 import com.madhu.atlas.agent.ToolSpec
+import com.madhu.atlas.profile.ProfileCategories
+import com.madhu.atlas.profile.ProfileStore
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
@@ -63,7 +65,7 @@ fun deviceTools(context: Context): List<Tool> {
             val i = Intent(AlarmClock.ACTION_SET_ALARM)
                 .putExtra(AlarmClock.EXTRA_HOUR, hour)
                 .putExtra(AlarmClock.EXTRA_MINUTES, minute)
-                .putExtra(AlarmClock.EXTRA_SKIP_UI, false)
+                .putExtra(AlarmClock.EXTRA_SKIP_UI, true)   // create it directly, don't make the user finish
             a.str("message")?.let { i.putExtra(AlarmClock.EXTRA_MESSAGE, it) }
             fired(app, i, "Alarm set for %02d:%02d.".format(hour, minute))
         },
@@ -78,18 +80,75 @@ fun deviceTools(context: Context): List<Tool> {
         },
 
         // ── comms ───────────────────────────────────────────────────────────
-        tool("compose_email", "Open the email composer, optionally prefilled.",
-            obj("to" to str("Recipient"), "subject" to str("Subject"), "body" to str("Body"))) { a ->
-            val i = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:"))
-            a.str("to")?.let { i.putExtra(Intent.EXTRA_EMAIL, arrayOf(it)) }
-            a.str("subject")?.let { i.putExtra(Intent.EXTRA_SUBJECT, it) }
-            a.str("body")?.let { i.putExtra(Intent.EXTRA_TEXT, it) }
-            fired(app, i, "Opened email composer.")
+        tool("compose_email", "Open the email composer, prefilled with recipient/subject/body.",
+            obj("to" to str("Recipient email address"), "subject" to str("Subject"), "body" to str("Body"))) { a ->
+            // Build the recipient + query into the mailto: URI itself. Gmail and most
+            // clients ignore EXTRA_EMAIL/SUBJECT/TEXT on an empty "mailto:", but honour
+            // mailto:addr?subject=…&body=… — so the fields actually prefill.
+            val to = a.str("to").orEmpty()
+            val params = buildList {
+                a.str("subject")?.let { add("subject=" + Uri.encode(it)) }
+                a.str("body")?.let { add("body=" + Uri.encode(it)) }
+            }.joinToString("&")
+            val uri = "mailto:" + Uri.encode(to) + if (params.isNotEmpty()) "?$params" else ""
+            fired(app, Intent(Intent.ACTION_SENDTO, Uri.parse(uri)), "Opened email composer.")
         },
-        tool("dial_number", "Open the dialer with a number ready to call.",
-            obj("number" to str("Phone number")),"number") { a ->
-            val num = a.str("number") ?: return@tool bad("number required")
-            fired(app, Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num")), "Dialer open for $num.")
+        tool("find_contact",
+            "Look up a person's phone number from contacts by name. Use this BEFORE calling " +
+                "someone by name, then confirm with the user before call_number.",
+            obj("name" to str("Contact name (may be partial)")),"name") { a ->
+            val name = a.str("name") ?: return@tool bad("name required")
+            val hits = Contacts.resolve(app, name)
+            when {
+                hits.isEmpty() -> bad("No contact matching \"$name\" (or contacts permission not granted).")
+                else -> ok(hits.take(5).joinToString("; ") { "${it.name} — ${it.number}" })
+            }
+        },
+        tool("call_number",
+            "Place a phone call to a number. Only call after the user has confirmed. " +
+                "For a person, use find_contact first to get the number.",
+            obj("number" to str("Phone number to call")),"number") { a ->
+            val num = (a.str("number") ?: return@tool bad("number required"))
+                .filter { it.isDigit() || it == '+' }
+            if (num.isEmpty()) return@tool bad("That doesn't look like a phone number.")
+            // Actually place the call when CALL_PHONE is granted; otherwise open the dialer.
+            val canCall = androidx.core.content.ContextCompat.checkSelfPermission(
+                app, android.Manifest.permission.CALL_PHONE
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val action = if (canCall) Intent.ACTION_CALL else Intent.ACTION_DIAL
+            val msg = if (canCall) "Calling $num." else "Dialer open for $num (grant call permission to dial automatically)."
+            fired(app, Intent(action, Uri.parse("tel:$num")), msg)
+        },
+        tool("answer_call", "Answer the currently ringing incoming call.", obj()) { _ ->
+            if (CallControl.answer(app)) ok("Answered the call.")
+            else bad("Couldn't answer — no ringing call, or the phone permission isn't granted.")
+        },
+        tool("end_call", "Reject the ringing call or hang up the current call.", obj()) { _ ->
+            if (CallControl.end(app)) ok("Ended the call.")
+            else bad("Couldn't end the call — nothing active, or the phone permission isn't granted.")
+        },
+        tool("reject_with_message",
+            "Reject the incoming call and text the caller a message (e.g. \"I'll call you back\").",
+            obj("message" to str("Message to send the caller")),"message") { a ->
+            val text = a.str("message") ?: return@tool bad("message required")
+            val number = CallState.lastIncomingNumber
+                ?: return@tool bad("I don't have the caller's number (needs call-log permission).")
+            CallControl.end(app)   // reject first
+            val canSms = androidx.core.content.ContextCompat.checkSelfPermission(
+                app, android.Manifest.permission.SEND_SMS
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (canSms) {
+                runCatching {
+                    val sms = app.getSystemService(android.telephony.SmsManager::class.java)
+                    sms.sendTextMessage(number, null, text, null, null)
+                }.fold(
+                    onSuccess = { ok("Rejected the call and texted $number.") },
+                    onFailure = { bad("Rejected, but couldn't send the text: ${it.message}") },
+                )
+            } else {
+                val i = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$number")).putExtra("sms_body", text)
+                fired(app, i, "Rejected the call — opened a message to $number.")
+            }
         },
         tool("send_sms", "Open the SMS composer to a number, optionally prefilled.",
             obj("number" to str("Phone number"), "message" to str("Message")),"number") { a ->
@@ -173,14 +232,23 @@ fun deviceTools(context: Context): List<Tool> {
             am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
             ok("Sent media '$action' to the active player.")
         },
-        tool("play_on_spotify", "Open Spotify and search for a song, artist, or playlist.",
+        tool("play_on_spotify", "Play a song, artist, or playlist on Spotify.",
             obj("query" to str("What to play")),"query") { a ->
             val q = a.str("query") ?: return@tool bad("query required")
-            val appIntent = Intent(Intent.ACTION_VIEW, Uri.parse("spotify:search:" + Uri.encode(q)))
-                .setPackage("com.spotify.music")
-            if (fire(app, appIntent)) ok("Searching Spotify for \"$q\".")
-            else fired(app, Intent(Intent.ACTION_VIEW,
-                Uri.parse("https://open.spotify.com/search/" + Uri.encode(q))), "Opened Spotify search for \"$q\".")
+            // MEDIA_PLAY_FROM_SEARCH makes Spotify actually start playing the best match,
+            // not just show search results. Fall back progressively if it can't.
+            fun playFromSearch(pkg: String?) = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
+                .putExtra(SearchManager.QUERY, q)
+                .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
+                .apply { if (pkg != null) setPackage(pkg) }
+            when {
+                fire(app, playFromSearch("com.spotify.music")) -> ok("Playing \"$q\" on Spotify.")
+                fire(app, playFromSearch(null)) -> ok("Playing \"$q\".")
+                fire(app, Intent(Intent.ACTION_VIEW, Uri.parse("spotify:search:" + Uri.encode(q)))
+                        .setPackage("com.spotify.music")) -> ok("Opened Spotify for \"$q\".")
+                else -> fired(app, Intent(Intent.ACTION_VIEW,
+                    Uri.parse("https://open.spotify.com/search/" + Uri.encode(q))), "Opened Spotify search for \"$q\".")
+            }
         },
         tool("toggle_flashlight", "Turn the flashlight/torch on or off.",
             obj("on" to bool("true = on, false = off"))) { a ->
@@ -213,6 +281,44 @@ fun deviceTools(context: Context): List<Tool> {
             val charging = bm.isCharging
             val now = SimpleDateFormat("EEE d MMM yyyy, h:mm a", Locale.getDefault()).format(Date())
             ok("Now: $now. Battery: $level%${if (charging) " (charging)" else ""}.")
+        },
+    )
+}
+
+/**
+ * Long-term memory tools — let the assistant durably learn/forget facts about the user
+ * in the [ProfileStore] (survives restarts; injected into every future system prompt).
+ * Registered alongside [deviceTools]. This is the user-directed "remember this" ability;
+ * it's separate from the automatic semantic memory of past exchanges.
+ */
+fun profileTools(profile: ProfileStore): List<Tool> {
+    val categories = ProfileCategories.ALL.joinToString(", ")
+    return listOf(
+        tool(
+            "remember_fact",
+            "Durably remember a fact about the user (name, preferences, projects, people, " +
+                "goals…). Use whenever the user asks you to remember something or shares a " +
+                "lasting detail about themselves.",
+            obj(
+                "fact" to str("The fact to store, phrased as a standalone statement."),
+                "category" to str("One of: $categories. Defaults to Other."),
+            ),
+            "fact",
+        ) { args ->
+            val fact = args.str("fact") ?: return@tool bad("Nothing to remember.")
+            val stored = profile.remember(args.str("category") ?: "Other", fact)
+            if (stored) ok("Got it — I'll remember that.") else ok("I already knew that.")
+        },
+        tool(
+            "forget_fact",
+            "Forget previously remembered facts about the user that match a query.",
+            obj("query" to str("What to forget, e.g. a keyword or phrase.")),
+            "query",
+        ) { args ->
+            val query = args.str("query") ?: return@tool bad("Say what to forget.")
+            val removed = profile.forget(query)
+            if (removed.isEmpty()) bad("I didn't have anything matching that.")
+            else ok("Forgot: ${removed.joinToString("; ")}")
         },
     )
 }

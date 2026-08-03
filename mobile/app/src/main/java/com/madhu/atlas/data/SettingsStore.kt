@@ -24,7 +24,12 @@ class SettingsStore(context: Context) {
     val onlineEnabled: Flow<Boolean> = store.data.map { it[ONLINE] ?: true }
     val appLockEnabled: Flow<Boolean> = store.data.map { it[APP_LOCK] ?: false }
 
+    /** Keep the "Hey Atlas" wake service running in the background (default on). */
+    val alwaysListening: Flow<Boolean> = store.data.map { it[ALWAYS_LISTENING] ?: true }
+
     suspend fun onlineEnabledNow(): Boolean = onlineEnabled.first()
+
+    suspend fun alwaysListeningNow(): Boolean = alwaysListening.first()
 
     suspend fun setOnlineEnabled(value: Boolean) {
         store.edit { it[ONLINE] = value }
@@ -34,8 +39,13 @@ class SettingsStore(context: Context) {
         store.edit { it[APP_LOCK] = value }
     }
 
+    suspend fun setAlwaysListening(value: Boolean) {
+        store.edit { it[ALWAYS_LISTENING] = value }
+    }
+
     private companion object {
         val ONLINE = booleanPreferencesKey("online_enabled")
         val APP_LOCK = booleanPreferencesKey("app_lock_enabled")
+        val ALWAYS_LISTENING = booleanPreferencesKey("always_listening")
     }
 }

@@ -26,6 +26,7 @@ npm-debug.log*
 
 # ── Android app (mobile/) ───────────────────────────────────────────────
 mobile/.gradle/
+mobile/.kotlin/
 mobile/build/
 mobile/app/build/
 mobile/captures/

@@ -19,6 +19,7 @@ import com.madhu.atlas.profile.AtlasDatabase
 import com.madhu.atlas.profile.ProfileStore
 import com.madhu.atlas.tools.Notifications
 import com.madhu.atlas.tools.deviceTools
+import com.madhu.atlas.tools.profileTools
 
 class AtlasApp : Application() {
     lateinit var container: AtlasContainer
@@ -62,5 +63,10 @@ class AtlasContainer(context: Context) {
 
     // The reused agent core, now with the M2 device toolset.
     private val systemPrompt = SystemPrompt(profile, memory)
-    val agentLoop = AgentLoop(router, systemPrompt, ToolRegistry(deviceTools(appContext)), memory)
+    val agentLoop = AgentLoop(
+        router,
+        systemPrompt,
+        ToolRegistry(deviceTools(appContext) + profileTools(profile)),
+        memory,
+    )
 }

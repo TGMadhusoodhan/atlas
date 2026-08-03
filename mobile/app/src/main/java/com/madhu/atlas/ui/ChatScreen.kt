@@ -89,7 +89,9 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
         SettingsDialog(
             onlineEnabled = state.onlineEnabled,
             hasApiKey = state.hasApiKey,
+            alwaysListening = state.alwaysListening,
             onToggleOnline = viewModel::setOnline,
+            onToggleAlwaysListening = viewModel::setAlwaysListening,
             onSaveKey = viewModel::saveApiKey,
             onDismiss = { showSettings = false },
         )
@@ -215,7 +217,9 @@ private fun InputBar(
 private fun SettingsDialog(
     onlineEnabled: Boolean,
     hasApiKey: Boolean,
+    alwaysListening: Boolean,
     onToggleOnline: (Boolean) -> Unit,
+    onToggleAlwaysListening: (Boolean) -> Unit,
     onSaveKey: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -229,6 +233,15 @@ private fun SettingsDialog(
                     Text("Use DeepSeek when online", modifier = Modifier.weight(1f))
                     Switch(checked = onlineEnabled, onCheckedChange = onToggleOnline)
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Always listening (background)", modifier = Modifier.weight(1f))
+                    Switch(checked = alwaysListening, onCheckedChange = onToggleAlwaysListening)
+                }
+                Text(
+                    "Keeps “Hey Atlas” running in the background (persistent notification, " +
+                        "uses more battery).",
+                    style = MaterialTheme.typography.labelSmall,
+                )
                 Text(
                     if (hasApiKey) "DeepSeek API key: saved" else "DeepSeek API key: not set",
                     style = MaterialTheme.typography.labelMedium,

@@ -41,6 +41,30 @@ object Notifications {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
+    /**
+     * Shown after boot when the OS blocks starting the mic service directly (Android 14+):
+     * tapping it opens the app, which then starts listening.
+     */
+    fun resumePrompt(context: Context) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) return
+        ensureChannel(context)
+        val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+        val pi = android.app.PendingIntent.getActivity(
+            context, 0, launch,
+            android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val n = NotificationCompat.Builder(context, CHANNEL_VOICE)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("ATLAS")
+            .setContentText("Tap to resume \"Hey Atlas\" listening")
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build()
+        NotificationManagerCompat.from(context).notify(43, n)
+    }
+
     fun showReminder(context: Context, text: String) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
