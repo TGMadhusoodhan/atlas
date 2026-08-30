@@ -54,6 +54,9 @@ device     = "cuda"            # RTX 3050
 compute    = "int8_float16"
 language   = "en"
 end_silence = 0.6              # seconds of silence that end your turn (lower = snappier)
+silero_sensitivity = 0.15      # lower = detect quieter speech
+webrtc_sensitivity = 0         # lower = less aggressive noise rejection
+normalize_audio = true         # boost quiet microphone input before VAD/STT
 
 [convo]
 silence_timeout = 6.0          # end the conversation after this many seconds of no speech
@@ -229,7 +232,7 @@ class AIHelper:
             req_id = f"voice-{self._req}"
             self._cur_id = req_id
             messages = [SYSTEM_PROMPT, *self.api_messages, {"role": "user", "content": text}]
-            self._send({"cmd": "chat", "id": req_id, "messages": messages,
+            self._send({"cmd": "preview_cloud", "id": req_id, "messages": messages,
                         "model": self.model, "thinking": self.thinking})
             buf, full = "", ""
             try:
@@ -246,7 +249,10 @@ class AIHelper:
                     if ev.get("id") != req_id:
                         continue
                     t = ev.get("type")
-                    if t == "token":
+                    if t == "cloud_preview":
+                        self._send({"cmd": "chat_approved", "id": req_id,
+                                    "token": ev.get("token", "")})
+                    elif t == "token":
                         tok = ev.get("text", "")
                         buf += tok
                         full += tok
@@ -376,6 +382,9 @@ def build_recorder(cfg: dict, on_recording_start, on_recording_stop):
         device=cfg_get(cfg, "stt", "device", default="cuda"),
         compute_type=cfg_get(cfg, "stt", "compute", default="int8_float16"),
         post_speech_silence_duration=float(cfg_get(cfg, "stt", "end_silence", default=0.6)),
+        silero_sensitivity=float(cfg_get(cfg, "stt", "silero_sensitivity", default=0.15)),
+        webrtc_sensitivity=int(cfg_get(cfg, "stt", "webrtc_sensitivity", default=0)),
+        normalize_audio=bool(cfg_get(cfg, "stt", "normalize_audio", default=True)),
         min_length_of_recording=0.3,
         spinner=False,
         on_recording_start=on_recording_start,
@@ -505,20 +514,29 @@ class VoiceSession:
         except queue.Empty:
             pass
 
-    def _next_utterance(self) -> str | None:
+    def _next_utterance(self, timeout: float | None = None) -> str | None:
         """Return the next user utterance, or None if they've gone quiet.
-        The silence countdown does NOT run while ATLAS is still speaking."""
-        deadline = time.monotonic() + self._silence_timeout
+
+        ``timeout=None`` waits until the user speaks or explicitly stops the
+        session.  This is used for the first turn so model/microphone startup
+        latency cannot end a conversation before it begins.  Follow-up turns
+        pass the configured silence timeout.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
         while self._active:
             # Don't time out while ATLAS is talking OR while the user is mid-utterance
             # (a long sentence keeps recorder.text() busy — that's not silence).
-            if (self._tts and self._tts.speaking) or self._user_speaking:
-                deadline = time.monotonic() + self._silence_timeout
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
+            if deadline is not None:
+                if (self._tts and self._tts.speaking) or self._user_speaking:
+                    deadline = time.monotonic() + timeout
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                wait = min(remaining, 0.2)
+            else:
+                wait = 0.2
             try:
-                return self._utterances.get(timeout=min(remaining, 0.2))
+                return self._utterances.get(timeout=wait)
             except queue.Empty:
                 continue
         return None
@@ -540,12 +558,15 @@ class VoiceSession:
             self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
             self._listener_thread.start()
 
+            first_turn = True
             while self._active:
-                transcript = self._next_utterance()
+                transcript = self._next_utterance(
+                    None if first_turn else self._silence_timeout)
                 if not self._active or transcript is None:
                     if transcript is None:
                         log("silence timeout — ending conversation")
                     break
+                first_turn = False
                 log(f"turn: {transcript!r} (tts.speaking={bool(self._tts and self._tts.speaking)})")
 
                 if _is_exit(transcript):

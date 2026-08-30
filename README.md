@@ -50,6 +50,17 @@ bind = SUPER, A, exec, qs ipc -p ~/atlas call ai-sidebar toggle
 
 Semantic memory + profile live under `~/.local/share/ai-sidebar/` (outside the repo).
 
+Desktop reliability, latency, and token usage measurements stay local in
+`~/.local/share/ai-sidebar/metrics.jsonl`. Summarize them with:
+
+```bash
+venv/bin/python helper/metrics_report.py
+```
+
+Cost remains unknown unless current rates are explicitly configured with
+`ATLAS_INPUT_USD_PER_MILLION_TOKENS` and
+`ATLAS_OUTPUT_USD_PER_MILLION_TOKENS`.
+
 ## Mobile quick start
 
 Open `mobile/` in Android Studio and run on a device. It works immediately on the

@@ -179,6 +179,24 @@ ShellRoot {
             }
 
             onRequestLoadLast: root.send({ cmd: "load_last", limit: 100 })
+
+            onToolApproval: (reqId, callId, name, arguments, approved) => {
+                root.send({ cmd: "tool_approval", id: reqId, call_id: callId,
+                            name: name, arguments: arguments, approved: approved })
+            }
+
+            onPreviewCloud: (messages, model, thinking, reqId) => {
+                root.send({ cmd: "preview_cloud", id: reqId, messages: messages,
+                            model: model, thinking: thinking })
+            }
+
+            onSendApprovedCloud: (token, reqId) => {
+                root.send({ cmd: "chat_approved", id: reqId, token: token })
+            }
+
+            onDiscardCloudPreview: token => {
+                root.send({ cmd: "discard_cloud_preview", token: token })
+            }
         }
     }
 }

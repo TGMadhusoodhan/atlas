@@ -58,6 +58,7 @@ Item {
             lineHeight: 1.65
             textFormat: Text.PlainText
         }
+
     }
 
     // ── Tool call block ───────────────────────────────────────────────────────
@@ -137,6 +138,16 @@ Item {
             wrapMode: Text.WrapAnywhere
             lineHeight: 1.4
             opacity: 0.75
+        }
+
+        Text {
+            visible: (root.message.resultState || "").length > 0
+            width: parent.width
+            text: root.message.resultState || ""
+            color: root.message.resultState === "FAILED" ? Theme.accent : Theme.textGhost
+            font.family: Theme.fontMono
+            font.pixelSize: 9
+            font.letterSpacing: 1
         }
     }
 

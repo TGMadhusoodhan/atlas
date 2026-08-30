@@ -47,7 +47,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now lockdown-daemon.service
 ```
 
-Check it's running: `curl http://127.0.0.1:8765/status`
+Check it through the user-owned socket:
+`curl --unix-socket "$XDG_RUNTIME_DIR/atlas-lockdown.sock" http://localhost/status`
 
 ### 2. Install the Firefox extension
 
@@ -81,15 +82,15 @@ Expected: tab redirects to the primary URL.
 **Test 4 — manual API:**
 ```bash
 # Start a 5-minute test session
-curl -s -X POST http://127.0.0.1:8765/start \
+curl --unix-socket "$XDG_RUNTIME_DIR/atlas-lockdown.sock" -s -X POST http://localhost/start \
   -H 'Content-Type: application/json' \
   -d '{"duration_seconds":300,"primary_target":"Test","primary_url":"","primary_app":"","allowed_apps":["kitty"],"allowed_domains":[]}'
 
 # Check status
-curl -s http://127.0.0.1:8765/status | python3 -m json.tool
+curl --unix-socket "$XDG_RUNTIME_DIR/atlas-lockdown.sock" -s http://localhost/status | python3 -m json.tool
 
 # End it
-curl -s -X POST http://127.0.0.1:8765/end
+curl --unix-socket "$XDG_RUNTIME_DIR/atlas-lockdown.sock" -s -X POST http://localhost/end
 ```
 
 ---
@@ -118,9 +119,10 @@ Fields: `start`, `end`, `target`, `duration_seconds`, `elapsed_seconds`, `allowe
 
 ---
 
-## Daemon HTTP API reference
+## Daemon control API reference
 
-All endpoints are on `http://127.0.0.1:8765`.
+Control endpoints use HTTP over `$XDG_RUNTIME_DIR/atlas-lockdown.sock`, mode `0600`.
+Only `/ws`, required by the Firefox extension, remains on loopback TCP port 8767.
 
 | Method | Path         | Body                                        | Description               |
 |--------|------------- |---------------------------------------------|---------------------------|

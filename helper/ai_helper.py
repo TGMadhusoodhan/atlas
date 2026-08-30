@@ -21,72 +21,48 @@ Events:   {"type":"status","id":"...","state":"thinking|streaming","model":"..."
 """
 
 import asyncio
-import datetime
 import json
 import os
-import subprocess
 import sys
 import threading
 import tomllib
-import urllib.error
-import urllib.request
+import copy
+import time
 from pathlib import Path
 
 import httpx
 
 import knowledge
+import lockdown_client
+import metrics
+from conversation_store import ConversationStore
+from cloud_preview import CloudPreviewBroker
+from tool_policy import ApprovalBroker, parse_tool_arguments, requires_approval
 import user_profile
 import vectordb
 
-LOCKDOWN_API = "http://127.0.0.1:8767"
-
-
 def _lockdown_call(method: str, path: str, body: dict | None = None) -> tuple[dict, bool]:
-    url = LOCKDOWN_API + path
-    try:
-        data = json.dumps(body).encode() if body is not None else None
-        req  = urllib.request.Request(
-            url, data=data, method=method,
-            headers={"Content-Type": "application/json"} if data else {},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read()), False
-    except urllib.error.URLError as e:
-        return {"error": f"Lockdown daemon not reachable ({e}). Start it with: python ~/ai-sidebar/lockdown/daemon.py"}, True
-    except Exception as e:
-        return {"error": str(e)}, True
+    return lockdown_client.request(method, path, body)
 
 CONFIG_PATH = Path.home() / ".config/ai-sidebar/config.toml"
 HISTORY_DIR = Path.home() / ".local/share/ai-sidebar/sessions"
+CONVERSATION_DB = Path.home() / ".local/share/ai-sidebar/conversations.sqlite3"
+_conversation_store: ConversationStore | None = None
 DEEPSEEK_BASE = "https://api.deepseek.com"
-MAX_TOOL_ITERATIONS = 20
+# One initial generation and, at most, one continuation after tool results.
+MAX_TOOL_ITERATIONS = 2
 OUTPUT_TRUNCATE = 8000
 
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "bash",
-            "description": "Execute any shell command via bash -c. Returns stdout+stderr. Use for running programs, git, package managers, system info, file operations, etc.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Shell command to run"},
-                    "timeout": {"type": "integer", "description": "Timeout seconds (default 30, max 120)"}
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "read_file",
-            "description": "Read a file's contents. Use start_line/end_line for large files.",
+            "description": "Read a file within configured knowledge roots. Use start_line/end_line for large files.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Absolute or ~ path"},
+                    "path": {"type": "string", "description": "Path within a configured knowledge root"},
                     "start_line": {"type": "integer", "description": "First line (1-indexed, optional)"},
                     "end_line": {"type": "integer", "description": "Last line (1-indexed, optional)"}
                 },
@@ -97,23 +73,8 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "write_file",
-            "description": "Write content to a file, creating it and parent dirs if needed. Overwrites existing files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or ~ path"},
-                    "content": {"type": "string", "description": "Content to write"}
-                },
-                "required": ["path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "list_dir",
-            "description": "List directory contents with file types and sizes.",
+            "description": "List directory contents within configured knowledge roots.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -309,14 +270,10 @@ def emit(event: dict) -> None:
 
 
 def _format_input_text(name: str, args: dict) -> str:
-    if name == "bash":
-        return "$ " + args.get("command", "")
     if name == "read_file":
         path = args.get("path", "")
         sl, el = args.get("start_line"), args.get("end_line")
         return f"{path}:{sl}-{el}" if (sl or el) else path
-    if name == "write_file":
-        return args.get("path", "")
     if name == "list_dir":
         return args.get("path", "~")
     if name == "lockdown_status":
@@ -351,23 +308,9 @@ def _format_input_text(name: str, args: dict) -> str:
 def execute_tool(name: str, args: dict) -> tuple[str, bool]:
     """Returns (output, is_error). Runs synchronously — call via run_in_executor."""
     try:
-        if name == "bash":
-            cmd = args.get("command", "")
-            timeout = min(int(args.get("timeout", 30)), 120)
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True,
-                timeout=timeout, env={**os.environ}
-            )
-            out = result.stdout + result.stderr
-            if not out.strip():
-                out = f"(exit {result.returncode})"
-            if len(out) > OUTPUT_TRUNCATE:
-                out = out[:OUTPUT_TRUNCATE] + f"\n... (truncated, {len(out)} total chars)"
-            return out, result.returncode != 0
-
-        elif name == "read_file":
-            path = os.path.expanduser(args["path"])
-            with open(path, "r", errors="replace") as f:
+        if name == "read_file":
+            path = knowledge.resolve_allowed_path(args["path"])
+            with path.open("r", errors="replace") as f:
                 lines = f.readlines()
             sl = args.get("start_line")
             el = args.get("end_line")
@@ -378,24 +321,14 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
                 content = content[:OUTPUT_TRUNCATE] + f"\n... (truncated, {len(lines)} lines total)"
             return content or "(empty file)", False
 
-        elif name == "write_file":
-            path = os.path.expanduser(args["path"])
-            content = args["content"]
-            parent = os.path.dirname(os.path.abspath(path))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(path, "w") as f:
-                f.write(content)
-            return f"Written {len(content)} chars to {path}", False
-
         elif name == "list_dir":
-            path = os.path.expanduser(args.get("path", "~"))
+            path = knowledge.resolve_allowed_path(args.get("path"))
             entries = []
             for ename in sorted(os.listdir(path)):
-                full = os.path.join(path, ename)
+                full = path / ename
                 try:
-                    is_dir = os.path.isdir(full)
-                    size = os.stat(full).st_size
+                    is_dir = full.is_dir()
+                    size = full.stat().st_size
                     entries.append(f"{'d' if is_dir else 'f'}  {ename}" + (
                         "/" if is_dir else f"  ({size:,}b)"
                     ))
@@ -476,8 +409,6 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
         else:
             return f"Unknown tool: {name}", True
 
-    except subprocess.TimeoutExpired:
-        return f"Error: timed out after {args.get('timeout', 30)}s", True
     except Exception as exc:
         return f"Error: {type(exc).__name__}: {exc}", True
 
@@ -531,13 +462,42 @@ def _inject_context(api_messages: list) -> list:
     return [{"role": "system", "content": preamble.lstrip()}] + api_messages
 
 
+def _build_cloud_body(messages: list, model: str, thinking: bool) -> dict:
+    body: dict = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "tools": TOOLS,
+        "tool_choice": "auto",
+        "stream_options": {"include_usage": True},
+    }
+    if thinking:
+        body["thinking"] = {"type": "enabled", "budget_tokens": 8192}
+    return body
+
+
 async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
-                     cancel_event: asyncio.Event) -> None:
+                     cancel_event: asyncio.Event, approvals: ApprovalBroker,
+                     prepared_body: dict | None = None) -> None:
+    started_at = time.monotonic()
+    outcome = "FAILED"
+    usage: dict = {}
+    tool_call_count = 0
     api_key = get_api_key()
     if not api_key:
         emit({"type": "error", "id": req_id,
               "message": "No API key. Set DEEPSEEK_API_KEY or add api_key to ~/.config/ai-sidebar/config.toml"})
+        await asyncio.to_thread(
+            metrics.record_request,
+            request_id=req_id, model=model, outcome="NO_API_KEY",
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+            usage=usage, tool_calls=tool_call_count,
+        )
         return
+
+    if prepared_body:
+        model = prepared_body["model"]
+        thinking = "thinking" in prepared_body
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -545,7 +505,7 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
         "Accept": "text/event-stream",
     }
 
-    api_messages = _inject_context(list(messages))
+    api_messages = copy.deepcopy(prepared_body["messages"]) if prepared_body else _inject_context(list(messages))
     emit({"type": "status", "id": req_id, "state": "thinking", "model": model})
 
     try:
@@ -554,15 +514,8 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                 emit({"type": "cancelled", "id": req_id})
                 return
 
-            body: dict = {
-                "model": model,
-                "messages": api_messages,
-                "stream": True,
-                "tools": TOOLS,
-                "tool_choice": "auto",
-            }
-            if thinking:
-                body["thinking"] = {"type": "enabled", "budget_tokens": 8192}
+            body = copy.deepcopy(prepared_body) if (_iter == 0 and prepared_body) else \
+                _build_cloud_body(api_messages, model, thinking)
 
             text_content = ""
             tool_calls_raw: dict[int, dict] = {}
@@ -593,7 +546,15 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                             break
                         try:
                             chunk = json.loads(payload)
-                            choice = chunk["choices"][0]
+                            if isinstance(chunk.get("usage"), dict):
+                                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                                    usage[key] = int(usage.get(key, 0) or 0) + int(
+                                        chunk["usage"].get(key, 0) or 0
+                                    )
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                continue
+                            choice = choices[0]
                             delta = choice.get("delta", {})
 
                             reasoning = delta.get("reasoning_content") or ""
@@ -638,19 +599,7 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                 api_messages.append({"role": "assistant", "content": text_content})
                 final_api = [m for m in api_messages if m.get("role") != "system"]
                 emit({"type": "done", "id": req_id, "api_messages": final_api})
-                # Store this exchange in long-term semantic memory (fire-and-forget).
-                try:
-                    last_user = next(
-                        (m.get("content") for m in reversed(messages)
-                         if m.get("role") == "user" and isinstance(m.get("content"), str)),
-                        "",
-                    )
-                    if last_user and text_content.strip():
-                        exchange = f"User: {last_user.strip()}\nATLAS: {text_content.strip()}"
-                        asyncio.get_running_loop().run_in_executor(
-                            None, vectordb.add, exchange, "chat")
-                except Exception:
-                    pass
+                outcome = "SUCCEEDED"
                 return
 
             # Build API assistant message with tool_calls
@@ -665,6 +614,7 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                 }
                 for i in sorted(tool_calls_raw)
             ]
+            tool_call_count += len(tc_list)
             api_messages.append({
                 "role": "assistant",
                 "content": text_content or None,
@@ -680,20 +630,49 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
 
                 tc_name = tc["function"]["name"]
                 try:
-                    tc_args = json.loads(tc["function"]["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    tc_args = {}
+                    tc_args = parse_tool_arguments(tc["function"]["arguments"])
+                except ValueError as error:
+                    output = str(error)
+                    emit({"type": "tool_result", "id": req_id, "call_id": tc["id"],
+                          "output": output, "error": True, "state": "FAILED"})
+                    api_messages.append({
+                        "role": "tool", "tool_call_id": tc["id"], "content": output
+                    })
+                    continue
 
                 input_text = _format_input_text(tc_name, tc_args)
                 emit({"type": "tool_call", "id": req_id, "call_id": tc["id"],
                       "name": tc_name, "inputText": input_text})
 
-                output, is_error = await loop.run_in_executor(
-                    None, execute_tool, tc_name, tc_args
-                )
+                try:
+                    mutation = requires_approval(tc_name, tc_args)
+                except ValueError as error:
+                    output, is_error = str(error), True
+                else:
+                    if mutation:
+                        approved = await approvals.request(
+                            req_id, tc["id"], tc_name, tc_args,
+                            on_pending=lambda: emit({
+                                "type": "tool_approval_required", "id": req_id,
+                                "call_id": tc["id"], "name": tc_name,
+                                "arguments": tc_args, "inputText": input_text,
+                                "expires_in_seconds": approvals.timeout_seconds,
+                            }),
+                        )
+                        if not approved:
+                            output, is_error = "Mutation rejected or approval expired", True
+                        else:
+                            output, is_error = await loop.run_in_executor(
+                                None, execute_tool, tc_name, tc_args
+                            )
+                    else:
+                        output, is_error = await loop.run_in_executor(
+                            None, execute_tool, tc_name, tc_args
+                        )
 
                 emit({"type": "tool_result", "id": req_id, "call_id": tc["id"],
-                      "output": output, "error": is_error})
+                      "output": output, "error": is_error,
+                      "state": "FAILED" if is_error else "COMPLETED"})
 
                 api_messages.append({
                     "role": "tool",
@@ -707,72 +686,43 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
               "message": f"Reached max tool iterations ({MAX_TOOL_ITERATIONS})"})
 
     except asyncio.CancelledError:
+        outcome = "CANCELLED"
         emit({"type": "cancelled", "id": req_id})
     except httpx.TimeoutException:
+        outcome = "TIMEOUT"
         emit({"type": "error", "id": req_id, "message": "Request timed out"})
     except httpx.NetworkError as exc:
+        outcome = "NETWORK_ERROR"
         emit({"type": "error", "id": req_id, "message": f"Network error: {exc}"})
     except Exception as exc:
         emit({"type": "error", "id": req_id, "message": str(exc)})
+    finally:
+        await asyncio.to_thread(
+            metrics.record_request,
+            request_id=req_id, model=model, outcome=outcome,
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+            usage=usage, tool_calls=tool_call_count,
+        )
+
+
+def _conversations() -> ConversationStore:
+    global _conversation_store
+    if _conversation_store is None:
+        _conversation_store = ConversationStore(CONVERSATION_DB, HISTORY_DIR)
+    return _conversation_store
 
 
 def save_session(session_id: str, messages: list, api_messages: list | None = None) -> str:
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    path = HISTORY_DIR / f"{session_id}.json"
-    with open(path, "w") as f:
-        json.dump({
-            "id": session_id,
-            "created_at": datetime.datetime.now().isoformat(),
-            "messages": messages,
-            "api_messages": api_messages if api_messages is not None else messages,
-        }, f, ensure_ascii=False, indent=2)
-    return str(path)
+    _conversations().save(session_id, messages, api_messages)
+    return str(CONVERSATION_DB)
 
 
 def list_sessions() -> list:
-    if not HISTORY_DIR.exists():
-        return []
-    results = []
-    for p in sorted(HISTORY_DIR.glob("*.json"), reverse=True)[:50]:
-        try:
-            with open(p) as f:
-                data = json.load(f)
-            preview = next(
-                (m["content"][:80] for m in data.get("messages", [])
-                 if m.get("role") == "user" and isinstance(m.get("content"), str)),
-                ""
-            )
-            results.append({
-                "id": data.get("id", p.stem),
-                "created_at": data.get("created_at", ""),
-                "preview": preview,
-            })
-        except Exception:
-            pass
-    return results
+    return _conversations().list_sessions()
 
 
 def clear_history() -> int:
-    if not HISTORY_DIR.exists():
-        return 0
-    count = 0
-    for p in HISTORY_DIR.glob("*.json"):
-        p.unlink(missing_ok=True)
-        count += 1
-    return count
-
-
-async def run_extract(session_id: str, messages: list) -> None:
-    """Background: learn durable facts about the user from the latest exchange."""
-    key = get_api_key()
-    if not key:
-        return
-    try:
-        added = await user_profile.extract(session_id, messages, key)
-        if added:
-            emit({"type": "profile_updated", "facts": added})
-    except Exception:
-        pass
+    return _conversations().clear()
 
 
 async def main() -> None:
@@ -806,6 +756,8 @@ async def main() -> None:
 
     active_task: asyncio.Task | None = None
     cancel_event = asyncio.Event()
+    approvals = ApprovalBroker()
+    cloud_previews = CloudPreviewBroker()
 
     while True:
         try:
@@ -818,7 +770,27 @@ async def main() -> None:
             req = json.loads(line)
             cmd = req.get("cmd")
 
-            if cmd == "chat":
+            if cmd == "preview_cloud":
+                prepared = await asyncio.to_thread(
+                    lambda: _build_cloud_body(
+                        _inject_context(list(req.get("messages", []))),
+                        req.get("model", "deepseek-v4-flash"),
+                        req.get("thinking", False),
+                    )
+                )
+                token = cloud_previews.issue(req["id"], prepared)
+                emit({
+                    "type": "cloud_preview", "id": req["id"], "token": token,
+                    "payload": json.dumps(prepared, ensure_ascii=False, indent=2),
+                    "expires_in_seconds": cloud_previews.ttl_seconds,
+                })
+
+            elif cmd == "chat_approved":
+                prepared = cloud_previews.consume(req.get("id", ""), req.get("token", ""))
+                if prepared is None:
+                    emit({"type": "error", "id": req.get("id", "system"),
+                          "message": "Cloud preview expired or was already used"})
+                    continue
                 if active_task and not active_task.done():
                     cancel_event.set()
                     active_task.cancel()
@@ -830,15 +802,38 @@ async def main() -> None:
                 active_task = asyncio.create_task(
                     agent_loop(
                         req["id"],
-                        req["messages"],
+                        [],
                         req.get("model", "deepseek-v4-flash"),
                         req.get("thinking", False),
                         cancel_event,
+                        approvals,
+                        prepared,
                     )
                 )
 
+            elif cmd == "discard_cloud_preview":
+                cloud_previews.discard(req.get("token", ""))
+
+            elif cmd == "chat":
+                emit({"type": "error", "id": req.get("id", "system"),
+                      "message": "Cloud payload preview and approval are required"})
+
             elif cmd == "cancel":
                 cancel_event.set()
+
+            elif cmd == "tool_approval":
+                try:
+                    args = req.get("arguments", {})
+                    accepted = approvals.resolve(
+                        req["id"], req["call_id"], req["name"], args,
+                        req.get("approved") is True,
+                    )
+                    if not accepted:
+                        emit({"type": "error", "id": req.get("id", "system"),
+                              "message": "Approval was duplicate, expired, or did not match"})
+                except (KeyError, TypeError, ValueError) as error:
+                    emit({"type": "error", "id": req.get("id", "system"),
+                          "message": f"Invalid approval: {error}"})
 
             elif cmd == "save":
                 try:
@@ -848,33 +843,20 @@ async def main() -> None:
                         req.get("api_messages")
                     )
                     emit({"type": "saved", "path": path})
-                    asyncio.create_task(
-                        run_extract(req["id"], req.get("messages", []))
-                    )
                 except Exception as exc:
                     emit({"type": "error", "id": "system", "message": f"Save failed: {exc}"})
 
             elif cmd == "load_last":
                 limit = req.get("limit", 100)
-                loaded = False
-                if HISTORY_DIR.exists():
-                    for candidate in sorted(HISTORY_DIR.glob("*.json"), reverse=True):
-                        try:
-                            with open(candidate) as f:
-                                data = json.load(f)
-                            msgs = data.get("messages", [])[-limit:]
-                            api_msgs = data.get("api_messages", msgs)[-limit:]
-                            emit({
-                                "type": "session_loaded",
-                                "session_id": data.get("id", candidate.stem),
-                                "messages": msgs,
-                                "api_messages": api_msgs,
-                            })
-                            loaded = True
-                            break
-                        except Exception:
-                            continue
-                if not loaded:
+                data = _conversations().load_last(limit)
+                if data:
+                    emit({
+                        "type": "session_loaded",
+                        "session_id": data["id"],
+                        "messages": data["messages"],
+                        "api_messages": data["api_messages"],
+                    })
+                else:
                     emit({"type": "session_loaded", "session_id": "",
                           "messages": [], "api_messages": []})
 

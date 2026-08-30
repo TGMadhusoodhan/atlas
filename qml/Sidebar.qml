@@ -11,6 +11,10 @@ Item {
     signal cancelMessage(string reqId)
     signal saveSession(var messages, var apiMessages, string sessionId)
     signal requestLoadLast()
+    signal toolApproval(string reqId, string callId, string name, var arguments, bool approved)
+    signal previewCloud(var messages, string model, bool thinking, string reqId)
+    signal sendApprovedCloud(string token, string reqId)
+    signal discardCloudPreview(string token)
 
     // ── State ─────────────────────────────────────────────────────────────────
     property bool shown: false
@@ -31,6 +35,40 @@ Item {
     property string activeModel:      ""
     property string currentSessionId: ""
     property bool   researchMode:     false
+    property var    pendingApproval:  null
+    property var    pendingCloudPreview: null
+
+    function resolveApproval(approved) {
+        if (!root.pendingApproval) return
+        var approval = root.pendingApproval
+        root.pendingApproval = null
+        root.status = "thinking"
+        root.statusMsg = approved ? "Mutation approved once" : "Mutation rejected"
+        root.toolApproval(root.activeReqId, approval.call_id, approval.name,
+                          approval.arguments, approved)
+    }
+
+    function resolveCloudPreview(approved) {
+        if (!root.pendingCloudPreview) return
+        var preview = root.pendingCloudPreview
+        root.pendingCloudPreview = null
+        if (approved) {
+            root.status = "thinking"
+            root.statusMsg = "Cloud request approved"
+            root.sendApprovedCloud(preview.token, root.activeReqId)
+        } else {
+            root.discardCloudPreview(preview.token)
+            var visible = root.conversation.slice()
+            if (visible.length && visible[visible.length - 1].role === "user") visible.pop()
+            root.conversation = visible
+            var api = root.apiMessages.slice()
+            if (api.length && api[api.length - 1].role === "user") api.pop()
+            root.apiMessages = api
+            root.isStreaming = false
+            root.status = "idle"
+            root.statusMsg = ""
+        }
+    }
 
     // ── Event dispatcher (called from shell.qml) ──────────────────────────────
     // Voice helper events (voice/voice_helper.py) — reflect PTT state on the
@@ -91,6 +129,8 @@ Item {
         }
 
         case "tool_result": {
+            if (root.pendingApproval && root.pendingApproval.call_id === ev.call_id)
+                root.pendingApproval = null
             var msgs = root.conversation.slice()
             for (var i = msgs.length - 1; i >= 0; i--) {
                 if (msgs[i].role === "tool_use" && msgs[i].call_id === ev.call_id) {
@@ -101,7 +141,8 @@ Item {
                         inputText: msgs[i].inputText,
                         output:    ev.output  || "",
                         running:   false,
-                        hasError:  ev.error   === true
+                        hasError:  ev.error   === true,
+                        resultState: ev.state || (ev.error === true ? "FAILED" : "COMPLETED")
                     }
                     msgs[i] = updated
                     root.conversation = msgs
@@ -111,6 +152,18 @@ Item {
             }
             break
         }
+
+        case "tool_approval_required":
+            root.pendingApproval = ev
+            root.status = "awaiting_confirmation"
+            root.statusMsg = "Review desktop mutation"
+            break
+
+        case "cloud_preview":
+            root.pendingCloudPreview = ev
+            root.status = "awaiting_confirmation"
+            root.statusMsg = "Review exact cloud payload"
+            break
 
         case "done": {
             if (root.streamingContent) {
@@ -131,6 +184,8 @@ Item {
         }
 
         case "error":
+            root.pendingApproval = null
+            root.pendingCloudPreview = null
             root.statusMsg = ev.message
             root.status = "error"
             root.isStreaming = false
@@ -139,6 +194,7 @@ Item {
             break
 
         case "cancelled":
+            root.pendingApproval = null
             root.isStreaming = false
             root.streamingContent = ""
             root.thinkingContent = ""
@@ -158,7 +214,7 @@ Item {
     // ── Actions ───────────────────────────────────────────────────────────────
     readonly property var systemPrompt: [{
         role: "system",
-        content: "You are a powerful AI assistant with full access to the user's system. You can execute shell commands, read and write files, browse directories, and perform any operation through your tools.\n\nAlways help with whatever the user needs. Use tools proactively — don't just explain, actually do it. Chain multiple tool calls to complete complex tasks. When editing files, read them first, then write the complete modified version. Never refuse.\n\nSystem: Arch Linux, Hyprland desktop. Home: /home/MadhuArch.\n\nFocus/Lockdown mode: You have four lockdown tools — lockdown_status, lockdown_start, lockdown_exception, lockdown_end. Focus profiles (pre-mapped sites/apps) live at ~/.config/ai-sidebar/focus_profiles/ as TOML files.\n\nWhen the user says they want to focus, study, concentrate, lock in, or work on something without distraction:\n1. Call lockdown_status to get the current state and monitor list.\n2. Ask ONE clarifying question covering: the specific site or app they'll use, any supporting apps they need (terminal, editor), and — if 2+ monitors are available — which monitor to disable. Keep it to one question, not an interrogation.\n3. Parse natural-language duration: 'one hour'=3600, '90 minutes'=5400, '45 min'=2700, 'two hours'=7200.\n4. Call lockdown_start with all parameters. Confirm back briefly: 'Locked in on X for Y minutes. Terminal and VSCode also allowed. Ask me if you need anything.'\n\nWhile a session is ACTIVE: route 'let me add X' / 'I need X' / 'can I open Y' requests to lockdown_exception. Do NOT treat them as normal chat.\n\nRecognize these as lockdown_end: 'end the timer', 'stop focus', 'end lockdown', 'I'm done', 'unlock', 'stop the session'."
+        content: "You are a private desktop assistant with read-only access to files inside explicitly configured knowledge roots. You do not have shell, file-write, or unrestricted system access. Every available mutation requires the user's explicit one-time approval before execution. Never claim a tool ran unless its result says it completed.\n\nSystem: Arch Linux, Hyprland desktop.\n\nFocus/Lockdown mode: lockdown_status is read-only. lockdown_start, lockdown_exception, and lockdown_end are mutations and require confirmation. Ask one concise clarifying question for missing focus target, supporting apps, duration, and monitor choice before proposing lockdown_start."
     }]
 
     function submit(text) {
@@ -183,8 +239,8 @@ Item {
             var api = root.apiMessages.slice()
             api.push(userMsg)
             root.apiMessages = api
-            root.sendMessage(root.systemPrompt.concat(api), root.selectedModel,
-                             root.thinkingMode, root.activeReqId)
+            root.previewCloud(root.systemPrompt.concat(api), root.selectedModel,
+                              root.thinkingMode, root.activeReqId)
         }
     }
 
@@ -291,6 +347,143 @@ Item {
                 onSubmit: text => root.submit(text)
                 onStop:   root.cancelMessage(root.activeReqId)
                 onToggleResearch: root.researchMode = !root.researchMode
+            }
+        }
+
+        Rectangle {
+            visible: root.pendingApproval !== null
+            anchors.fill: parent
+            z: 20
+            color: Qt.rgba(0, 0, 0, 0.72)
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 32, 420)
+                height: approvalColumn.implicitHeight + 32
+                radius: Theme.radius
+                color: Theme.bgInput
+                border.color: Theme.accent
+
+                Column {
+                    id: approvalColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: 16
+                    spacing: 12
+
+                    Text {
+                        width: parent.width
+                        text: "Confirm desktop mutation"
+                        color: Theme.textPrimary
+                        font.family: Theme.fontMono
+                        font.bold: true
+                    }
+                    Text {
+                        width: parent.width
+                        text: root.pendingApproval
+                              ? (root.pendingApproval.name + "\n" + root.pendingApproval.inputText)
+                              : ""
+                        color: Theme.textMuted
+                        font.family: Theme.fontMono
+                        wrapMode: Text.WrapAnywhere
+                    }
+                    Row {
+                        anchors.right: parent.right
+                        spacing: 10
+                        Rectangle {
+                            width: 84; height: 32; radius: Theme.radius
+                            color: rejectHover.hovered ? Qt.rgba(1,1,1,0.08) : "transparent"
+                            border.color: Theme.border
+                            Text { anchors.centerIn: parent; text: "Reject"; color: Theme.textPrimary }
+                            HoverHandler { id: rejectHover }
+                            TapHandler { onTapped: root.resolveApproval(false) }
+                        }
+                        Rectangle {
+                            width: 84; height: 32; radius: Theme.radius
+                            color: approveHover.hovered ? Qt.rgba(0.769,0.106,0.173,0.35) : Theme.accent
+                            Text { anchors.centerIn: parent; text: "Approve"; color: "white" }
+                            HoverHandler { id: approveHover }
+                            TapHandler { onTapped: root.resolveApproval(true) }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        Rectangle {
+            visible: root.pendingCloudPreview !== null
+            anchors.fill: parent
+            z: 21
+            color: Qt.rgba(0, 0, 0, 0.78)
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: parent.width - 24
+                height: Math.min(parent.height - 48, 560)
+                radius: Theme.radius
+                color: Theme.bgInput
+                border.color: Theme.borderFocus
+
+                Column {
+                    anchors.fill: parent
+                    anchors.margins: 14
+                    spacing: 10
+
+                    Text {
+                        width: parent.width
+                        text: "Exact initial cloud request"
+                        color: Theme.textPrimary
+                        font.family: Theme.fontMono
+                        font.bold: true
+                    }
+                    Text {
+                        width: parent.width
+                        text: "Review before anything is sent to DeepSeek. Authorization credentials are not shown."
+                        color: Theme.textMuted
+                        font.family: Theme.fontMono
+                        font.pixelSize: 10
+                        wrapMode: Text.Wrap
+                    }
+                    Flickable {
+                        width: parent.width
+                        height: parent.height - 112
+                        clip: true
+                        contentWidth: width
+                        contentHeight: cloudPayloadText.implicitHeight
+
+                        Text {
+                            id: cloudPayloadText
+                            width: parent.width
+                            text: root.pendingCloudPreview ? root.pendingCloudPreview.payload : ""
+                            color: Theme.textPrimary
+                            font.family: Theme.fontMono
+                            font.pixelSize: 10
+                            wrapMode: Text.WrapAnywhere
+                            textFormat: Text.PlainText
+                        }
+                    }
+                    Row {
+                        anchors.right: parent.right
+                        spacing: 10
+                        Rectangle {
+                            width: 92; height: 32; radius: Theme.radius
+                            color: cloudCancelHover.hovered ? Qt.rgba(1,1,1,0.08) : "transparent"
+                            border.color: Theme.border
+                            Text { anchors.centerIn: parent; text: "Cancel"; color: Theme.textPrimary }
+                            HoverHandler { id: cloudCancelHover }
+                            TapHandler { onTapped: root.resolveCloudPreview(false) }
+                        }
+                        Rectangle {
+                            width: 108; height: 32; radius: Theme.radius
+                            color: cloudSendHover.hovered ? Qt.rgba(0.769,0.106,0.173,0.35) : Theme.accent
+                            Text { anchors.centerIn: parent; text: "Send once"; color: "white" }
+                            HoverHandler { id: cloudSendHover }
+                            TapHandler { onTapped: root.resolveCloudPreview(true) }
+                        }
+                    }
+                }
             }
         }
     }

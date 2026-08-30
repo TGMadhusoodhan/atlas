@@ -88,7 +88,7 @@ def load_config() -> tuple[list[str], list[str], int]:
 
     existing = []
     for r in roots:
-        p = Path(os.path.expanduser(str(r)))
+        p = Path(os.path.expanduser(str(r))).resolve()
         if p.exists():
             existing.append(str(p))
     return existing, ignore, max_results
@@ -101,17 +101,34 @@ def _ignore_args(ignore: list[str]) -> list[str]:
     return args
 
 
+def _is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_allowed_path(path: str | None) -> Path:
+    """Resolve an existing retrieval target, rejecting traversal and symlink escape."""
+    roots, _, _ = load_config()
+    if not roots:
+        raise PermissionError("No knowledge roots are configured")
+    candidate = Path(os.path.expanduser(path)).resolve() if path else Path(roots[0])
+    if not any(_is_within(candidate, Path(root)) for root in roots):
+        raise PermissionError(f"Path is outside configured knowledge roots: {path}")
+    return candidate
+
+
 def _scope(roots: list[str], path_filter: str | None) -> list[str]:
     if not path_filter:
         return roots
-    pf = os.path.expanduser(path_filter)
-    matched = [r for r in roots if pf in r or r in pf]
+    matched = [r for r in roots if path_filter.casefold() in {
+        r.casefold(), Path(r).name.casefold()
+    }]
     if matched:
         return matched
-    # Allow searching an explicit subpath that lives under a root.
-    if os.path.exists(pf) and any(pf.startswith(r) for r in roots):
-        return [pf]
-    return roots
+    return [str(resolve_allowed_path(path_filter))]
 
 
 def roots_summary() -> str:
@@ -130,7 +147,12 @@ def search(query: str, path_filter: str | None = None,
     if not roots:
         return "No knowledge roots configured or none exist. Edit ~/.config/ai-sidebar/knowledge.toml."
     limit = min(max_results or cfg_max, 100)
-    scope = _scope(roots, path_filter)
+    if not isinstance(query, str) or not query.strip():
+        return "Search query must be a non-empty string."
+    try:
+        scope = _scope(roots, path_filter)
+    except (OSError, PermissionError) as error:
+        return f"Search scope rejected: {error}"
 
     cmd = [
         "rg", "--line-number", "--no-heading", "--color", "never",
@@ -164,7 +186,10 @@ def list_files(path_filter: str | None = None, limit: int = 300) -> str:
     roots, ignore, _ = load_config()
     if not roots:
         return "No knowledge roots configured. Edit ~/.config/ai-sidebar/knowledge.toml."
-    scope = _scope(roots, path_filter)
+    try:
+        scope = _scope(roots, path_filter)
+    except (OSError, PermissionError) as error:
+        return f"Listing scope rejected: {error}"
     cmd = ["rg", "--files", *_ignore_args(ignore), *scope]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)

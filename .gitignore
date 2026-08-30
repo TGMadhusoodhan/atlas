@@ -33,6 +33,8 @@ mobile/captures/
 mobile/local.properties
 mobile/.cxx/
 mobile/.externalNativeBuild/
+# Spotify App Remote SDK binary (download per Spotify's licence, don't redistribute)
+mobile/app/libs/*.aar
 **/*.iml
 .idea/
 

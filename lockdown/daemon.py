@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Lockdown daemon for ai-sidebar focus mode.
-Control API:            http://127.0.0.1:8765
-Browser ext WebSocket:  ws://127.0.0.1:8765/ws
+Control API:            HTTP over a user-owned Unix-domain socket
+Browser ext WebSocket:  ws://127.0.0.1:8767/ws
 """
 
 import asyncio
@@ -22,6 +22,8 @@ from aiohttp import web, WSMsgType
 # ── Constants ──────────────────────────────────────────────────────────────────
 HTTP_HOST       = "127.0.0.1"
 HTTP_PORT       = 8767
+RUNTIME_DIR     = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+CONTROL_SOCKET  = Path(os.environ.get("ATLAS_LOCKDOWN_SOCKET", RUNTIME_DIR / "atlas-lockdown.sock"))
 LOCKDOWN_WS_ID  = 99
 STATE_PATH      = Path.home() / ".local/share/ai-sidebar/lockdown_state.json"
 LOG_PATH        = Path.home() / ".local/share/ai-sidebar/focus_log.jsonl"
@@ -590,25 +592,42 @@ class LockdownDaemon:
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+def create_control_app(daemon: LockdownDaemon) -> web.Application:
+    app = web.Application()
+    app.router.add_post("/start", daemon.handle_start)
+    app.router.add_post("/end", daemon.handle_end)
+    app.router.add_post("/exception", daemon.handle_exception)
+    app.router.add_get("/status", daemon.handle_status)
+    app.router.add_get("/monitors", daemon.handle_monitors)
+    return app
+
+
+def create_browser_app(daemon: LockdownDaemon) -> web.Application:
+    app = web.Application()
+    app.router.add_get("/ws", daemon.handle_ws)
+    return app
+
+
 async def main() -> None:
     daemon = LockdownDaemon()
     await daemon.check_stale_state()
 
     asyncio.create_task(daemon.hypr_event_loop())
 
-    app = web.Application()
-    app.router.add_post("/start",     daemon.handle_start)
-    app.router.add_post("/end",       daemon.handle_end)
-    app.router.add_post("/exception", daemon.handle_exception)
-    app.router.add_get( "/status",    daemon.handle_status)
-    app.router.add_get( "/monitors",  daemon.handle_monitors)
-    app.router.add_get( "/ws",        daemon.handle_ws)
+    CONTROL_SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    CONTROL_SOCKET.unlink(missing_ok=True)
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, HTTP_HOST, HTTP_PORT)
-    await site.start()
-    log.info(f"Lockdown daemon on http://{HTTP_HOST}:{HTTP_PORT}")
+    control_runner = web.AppRunner(create_control_app(daemon))
+    browser_runner = web.AppRunner(create_browser_app(daemon))
+    await control_runner.setup()
+    await browser_runner.setup()
+    control_site = web.UnixSite(control_runner, str(CONTROL_SOCKET))
+    browser_site = web.TCPSite(browser_runner, HTTP_HOST, HTTP_PORT)
+    await control_site.start()
+    os.chmod(CONTROL_SOCKET, 0o600)
+    await browser_site.start()
+    log.info("Lockdown control socket: %s (mode 0600)", CONTROL_SOCKET)
+    log.info("Browser enforcement WebSocket: ws://%s:%d/ws", HTTP_HOST, HTTP_PORT)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -620,7 +639,9 @@ async def main() -> None:
     finally:
         if daemon.active:
             await daemon.end_lockdown(notify=False)
-        await runner.cleanup()
+        await control_runner.cleanup()
+        await browser_runner.cleanup()
+        CONTROL_SOCKET.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
