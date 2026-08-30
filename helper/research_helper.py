@@ -117,8 +117,8 @@ def _progress(req_id: str, step: str, detail: str) -> dict:
 
 # ── Query generation ──────────────────────────────────────────────────────────
 
-async def generate_query(question: str, api_key: str, model: str) -> str:
-    body = {
+def build_query_body(question: str, model: str) -> dict:
+    return {
         "model": model,
         "messages": [
             {
@@ -133,6 +133,10 @@ async def generate_query(question: str, api_key: str, model: str) -> str:
         "max_tokens": 30,
         "stream": False,
     }
+
+
+async def generate_query(question: str, api_key: str, model: str) -> str:
+    body = build_query_body(question, model)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(f"{DEEPSEEK_BASE}/v1/chat/completions", json=body, headers=headers)
@@ -349,7 +353,8 @@ def _log_run(question: str, query: str, attempted: int, scraped: int, model: str
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
 async def research_pipeline(req_id: str, question: str, model: str,
-                            cancel_event: asyncio.Event) -> None:
+                            cancel_event: asyncio.Event,
+                            history: list[dict] | None = None) -> None:
     api_key = get_api_key()
     if not api_key:
         emit({"type": "error", "id": req_id,
@@ -429,7 +434,7 @@ async def research_pipeline(req_id: str, question: str, model: str,
             "id": req_id,
             "sources": sources,
             "api_messages": [
-                {"role": "user",      "content": question},
+                *(history or [{"role": "user", "content": question}]),
                 {"role": "assistant", "content": answer},
             ],
         })

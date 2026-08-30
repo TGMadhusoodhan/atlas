@@ -8,10 +8,8 @@ Rectangle {
 
     signal submit(string text)
     signal stop()
-    signal toggleResearch()
 
     property bool isStreaming:  false
-    property bool researchMode: false
 
     // Top hairline
     Rectangle {
@@ -26,7 +24,7 @@ Rectangle {
         id: inputBox
         anchors {
             left: parent.left;       leftMargin: 12
-            right: researchBtn.left; rightMargin: 8
+            right: sendBtn.left; rightMargin: 8
             top: parent.top;         topMargin: 10
             bottom: parent.bottom;   bottomMargin: 10
         }
@@ -56,7 +54,7 @@ Rectangle {
 
             TextArea {
                 id: inputArea
-                placeholderText: root.researchMode ? "Research…" : "Message…"
+                placeholderText: "Message…"
                 placeholderTextColor: Theme.textGhost
                 color: Theme.textPrimary
                 font.family: Theme.fontMono
@@ -77,58 +75,6 @@ Rectangle {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    // Research toggle — small globe/search icon, amber when active
-    Rectangle {
-        id: researchBtn
-        anchors.right: sendBtn.left
-        anchors.rightMargin: 6
-        anchors.verticalCenter: parent.verticalCenter
-        width: 30; height: 30
-        radius: Theme.radius
-        color: root.researchMode
-               ? Qt.rgba(0.290, 0.620, 0.800, 0.12)
-               : "transparent"
-        border.color: root.researchMode ? "#4A9ECC" : Theme.border
-        border.width: 1
-
-        Behavior on color        { ColorAnimation { duration: 120 } }
-        Behavior on border.color { ColorAnimation { duration: 120 } }
-
-        Text {
-            anchors.centerIn: parent
-            text: "⊕"
-            color: root.researchMode ? "#4A9ECC" : Theme.textMuted
-            font.pixelSize: 15
-            Behavior on color { ColorAnimation { duration: 120 } }
-        }
-
-        HoverHandler { id: rBtnHover }
-        TapHandler { onTapped: root.toggleResearch() }
-
-        // Tooltip on hover
-        Rectangle {
-            visible: rBtnHover.hovered
-            anchors.bottom: parent.top
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.bottomMargin: 4
-            width: tipText.implicitWidth + 12
-            height: 20
-            radius: 2
-            color: Theme.bgInput
-            border.color: Theme.border
-            border.width: 1
-
-            Text {
-                id: tipText
-                anchors.centerIn: parent
-                text: root.researchMode ? "Research on" : "Research off"
-                color: Theme.textMuted
-                font.family: Theme.fontMono
-                font.pixelSize: 9
             }
         }
     }

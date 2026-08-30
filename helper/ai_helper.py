@@ -35,11 +35,20 @@ import httpx
 import knowledge
 import lockdown_client
 import metrics
+import research_helper
+from capabilities import system_prompt
+from desktop_tools import (
+    DESKTOP_TOOLS, DESKTOP_TOOL_NAMES, execute as execute_desktop_tool,
+    result_state as desktop_result_state,
+)
 from conversation_store import ConversationStore
 from cloud_preview import CloudPreviewBroker
-from tool_policy import ApprovalBroker, parse_tool_arguments, requires_approval
+from orchestrator import AtlasOrchestrator, Verifier
+from tool_policy import ApprovalBroker, is_mutating, parse_tool_arguments
 import user_profile
 import vectordb
+
+ORCHESTRATOR = AtlasOrchestrator()
 
 def _lockdown_call(method: str, path: str, body: dict | None = None) -> tuple[dict, bool]:
     return lockdown_client.request(method, path, body)
@@ -49,8 +58,8 @@ HISTORY_DIR = Path.home() / ".local/share/ai-sidebar/sessions"
 CONVERSATION_DB = Path.home() / ".local/share/ai-sidebar/conversations.sqlite3"
 _conversation_store: ConversationStore | None = None
 DEEPSEEK_BASE = "https://api.deepseek.com"
-# One initial generation and, at most, one continuation after tool results.
-MAX_TOOL_ITERATIONS = 2
+# Bounded room for action → verify → inspect failure → correct → re-verify workflows.
+MAX_TOOL_ITERATIONS = 8
 OUTPUT_TRUNCATE = 8000
 
 TOOLS = [
@@ -249,6 +258,7 @@ TOOLS = [
         }
     }
 ]
+TOOLS.extend(DESKTOP_TOOLS)
 
 
 def get_api_key() -> str:
@@ -270,6 +280,11 @@ def emit(event: dict) -> None:
 
 
 def _format_input_text(name: str, args: dict) -> str:
+    if name in DESKTOP_TOOL_NAMES:
+        visible = {key: value for key, value in args.items() if key not in {"text"}}
+        if name == "set_clipboard":
+            return f"Set clipboard text ({len(str(args.get('text', '')))} characters)"
+        return f"{name.replace('_', ' ')}: {json.dumps(visible, ensure_ascii=False)}"
     if name == "read_file":
         path = args.get("path", "")
         sl, el = args.get("start_line"), args.get("end_line")
@@ -305,9 +320,22 @@ def _format_input_text(name: str, args: dict) -> str:
     return json.dumps(args)
 
 
+def _verification_output(action: str, response, evidence: str,
+                         state: str = "VERIFIED") -> tuple[str, bool]:
+    return json.dumps({
+        "state": state,
+        "action": action,
+        "verification": evidence,
+        "output": response,
+    }, ensure_ascii=False), state == "FAILED"
+
+
 def execute_tool(name: str, args: dict) -> tuple[str, bool]:
     """Returns (output, is_error). Runs synchronously — call via run_in_executor."""
     try:
+        if name in DESKTOP_TOOL_NAMES:
+            return execute_desktop_tool(name, args)
+
         if name == "read_file":
             path = knowledge.resolve_allowed_path(args["path"])
             with path.open("r", errors="replace") as f:
@@ -347,15 +375,43 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
 
         elif name == "lockdown_start":
             result, err = _lockdown_call("POST", "/start", args)
-            return json.dumps(result), err
+            if err:
+                return _verification_output(name, result, "Lockdown start request failed", "FAILED")
+            status, status_err = _lockdown_call("GET", "/status")
+            verified = (not status_err and status.get("state") == "ACTIVE"
+                        and status.get("target") == args.get("primary_target"))
+            return _verification_output(
+                name, result,
+                f"Lockdown status is {status.get('state')} for {status.get('target')}",
+                "VERIFIED" if verified else "FAILED",
+            )
 
         elif name == "lockdown_exception":
             result, err = _lockdown_call("POST", "/exception", args)
-            return json.dumps(result), err
+            if err:
+                return _verification_output(name, result, "Exception request failed", "FAILED")
+            status, status_err = _lockdown_call("GET", "/status")
+            target = str(args.get("target", "")).lower()
+            present = target in {
+                str(item).lower() for item in [
+                    *status.get("allowed_apps", []), *status.get("allowed_domains", [])
+                ]
+            }
+            return _verification_output(
+                name, result, f"Lockdown allowlists contain target={present}",
+                "VERIFIED" if not status_err and present else "FAILED",
+            )
 
         elif name == "lockdown_end":
             result, err = _lockdown_call("POST", "/end", {})
-            return json.dumps(result), err
+            if err:
+                return _verification_output(name, result, "Lockdown end request failed", "FAILED")
+            status, status_err = _lockdown_call("GET", "/status")
+            verified = not status_err and status.get("state") == "IDLE"
+            return _verification_output(
+                name, result, f"Lockdown status is {status.get('state')}",
+                "VERIFIED" if verified else "FAILED",
+            )
 
         elif name == "knowledge_search":
             out = knowledge.search(args["query"], args.get("path_filter"))
@@ -366,12 +422,16 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
             return out, False
 
         elif name == "remember_fact":
+            fact = args.get("fact", "")
             added = user_profile.add_fact(
-                args.get("category", "Other"), args.get("fact", "")
+                args.get("category", "Other"), fact
             )
-            if added:
-                return f"Saved to profile: {args.get('fact', '')}", False
-            return "Already known — not duplicated.", False
+            verified = bool(user_profile.find_facts(fact))
+            message = f"Saved to profile: {fact}" if added else "Already known — not duplicated."
+            return _verification_output(
+                name, message, f"Profile read-back contains the fact={verified}",
+                "VERIFIED" if verified else "FAILED",
+            )
 
         elif name == "memory_search":
             hits = vectordb.search(args.get("query", ""), k=6)
@@ -393,7 +453,12 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
                         f"and, only if they confirm, call memory_forget again with confirm=true:\n"
                         f"{preview}"), False
             n = vectordb.delete([m["id"] for m in matches])
-            return f"Deleted {n} memory item(s).", False
+            remaining = vectordb.existing_ids([m["id"] for m in matches])
+            return _verification_output(
+                name, f"Deleted {n} memory item(s).",
+                f"Memory read-back found {len(remaining)} deleted ID(s)",
+                "VERIFIED" if not remaining else "FAILED",
+            )
 
         elif name == "forget_fact":
             matches = user_profile.find_facts(args.get("fact", ""))
@@ -404,13 +469,22 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
                 return (f"PREVIEW — {len(matches)} profile fact(s) match. Confirm with the user, "
                         f"then call forget_fact again with confirm=true:\n{preview}"), False
             removed = user_profile.remove_fact(args.get("fact", ""))
-            return f"Removed {len(removed)} profile fact(s): " + "; ".join(removed), False
+            remaining = user_profile.find_facts(args.get("fact", ""))
+            return _verification_output(
+                name, f"Removed {len(removed)} profile fact(s): " + "; ".join(removed),
+                f"Profile read-back found {len(remaining)} matching fact(s)",
+                "VERIFIED" if removed and not remaining else "FAILED",
+            )
 
         else:
             return f"Unknown tool: {name}", True
 
     except Exception as exc:
         return f"Error: {type(exc).__name__}: {exc}", True
+
+
+def _result_state(name: str, output: str, is_error: bool) -> str:
+    return desktop_result_state(output, is_error)
 
 
 def _inject_context(api_messages: list) -> list:
@@ -442,10 +516,8 @@ def _inject_context(api_messages: list) -> list:
          if m.get("role") == "user" and isinstance(m.get("content"), str)),
         "",
     )
-    try:
-        mems = vectordb.search(last_user, k=4) if last_user else []
-    except Exception:
-        mems = []
+    route, plan = ORCHESTRATOR.prepare(last_user)
+    mems = ORCHESTRATOR.memory.recall(last_user, vectordb.search)
     if mems:
         parts.append("\n## Relevant memory from past conversations\n"
                      + "\n".join(f"- {m['text']}" for m in mems))
@@ -453,7 +525,12 @@ def _inject_context(api_messages: list) -> list:
     if profile:
         parts.append("\n## What you already know about the user\n" + profile)
 
+    parts.append(ORCHESTRATOR.prompt_context(route, plan))
+
     preamble = "\n".join(parts)
+
+    if not api_messages or api_messages[0].get("role") != "system":
+        api_messages = [system_prompt("sidebar"), *api_messages]
 
     if api_messages and api_messages[0].get("role") == "system":
         head = dict(api_messages[0])
@@ -506,6 +583,15 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
     }
 
     api_messages = copy.deepcopy(prepared_body["messages"]) if prepared_body else _inject_context(list(messages))
+    objective = next(
+        (m.get("content", "") for m in reversed(api_messages)
+         if m.get("role") == "user" and isinstance(m.get("content"), str)),
+        "",
+    )
+    route, plan = ORCHESTRATOR.prepare(objective)
+    verifier = Verifier(route)
+    defer_output = route.needs_action or (route.needs_research and not route.needs_web_research)
+    emit({"type": "orchestration", "id": req_id, **ORCHESTRATOR.event(route, plan)})
     emit({"type": "status", "id": req_id, "state": "thinking", "model": model})
 
     try:
@@ -567,7 +653,8 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                                     emit({"type": "status", "id": req_id, "state": "streaming"})
                                     first_text = False
                                 text_content += content
-                                emit({"type": "token", "id": req_id, "text": content})
+                                if not defer_output:
+                                    emit({"type": "token", "id": req_id, "text": content})
 
                             for tc_delta in delta.get("tool_calls", []):
                                 idx = tc_delta.get("index", 0)
@@ -596,9 +683,25 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
 
             # Finished streaming this iteration
             if finish_reason == "stop" or not tool_calls_raw:
+                assessment = verifier.assess()
+                emit({"type": "verification", "id": req_id,
+                      "outcome": assessment.outcome, "terminal": assessment.terminal,
+                      "detail": assessment.feedback})
+                if not assessment.terminal and _iter + 1 < MAX_TOOL_ITERATIONS:
+                    api_messages.append({"role": "assistant", "content": text_content})
+                    api_messages.append({
+                        "role": "system",
+                        "content": "Verifier feedback: " + assessment.feedback,
+                    })
+                    emit({"type": "status", "id": req_id, "state": "thinking", "model": model})
+                    continue
                 api_messages.append({"role": "assistant", "content": text_content})
+                if defer_output and text_content:
+                    emit({"type": "status", "id": req_id, "state": "streaming"})
+                    emit({"type": "token", "id": req_id, "text": text_content})
                 final_api = [m for m in api_messages if m.get("role") != "system"]
-                emit({"type": "done", "id": req_id, "api_messages": final_api})
+                emit({"type": "done", "id": req_id, "api_messages": final_api,
+                      "verification": assessment.outcome})
                 outcome = "SUCCEEDED"
                 return
 
@@ -633,6 +736,7 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                     tc_args = parse_tool_arguments(tc["function"]["arguments"])
                 except ValueError as error:
                     output = str(error)
+                    verifier.record(name=tc_name, state="FAILED", mutating=False)
                     emit({"type": "tool_result", "id": req_id, "call_id": tc["id"],
                           "output": output, "error": True, "state": "FAILED"})
                     api_messages.append({
@@ -644,35 +748,21 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                 emit({"type": "tool_call", "id": req_id, "call_id": tc["id"],
                       "name": tc_name, "inputText": input_text})
 
+                mutation = False
                 try:
-                    mutation = requires_approval(tc_name, tc_args)
+                    mutation = is_mutating(tc_name, tc_args)
                 except ValueError as error:
                     output, is_error = str(error), True
                 else:
-                    if mutation:
-                        approved = await approvals.request(
-                            req_id, tc["id"], tc_name, tc_args,
-                            on_pending=lambda: emit({
-                                "type": "tool_approval_required", "id": req_id,
-                                "call_id": tc["id"], "name": tc_name,
-                                "arguments": tc_args, "inputText": input_text,
-                                "expires_in_seconds": approvals.timeout_seconds,
-                            }),
-                        )
-                        if not approved:
-                            output, is_error = "Mutation rejected or approval expired", True
-                        else:
-                            output, is_error = await loop.run_in_executor(
-                                None, execute_tool, tc_name, tc_args
-                            )
-                    else:
-                        output, is_error = await loop.run_in_executor(
-                            None, execute_tool, tc_name, tc_args
-                        )
+                    output, is_error = await loop.run_in_executor(
+                        None, execute_tool, tc_name, tc_args
+                    )
 
+                result_state = _result_state(tc_name, output, is_error)
+                verifier.record(name=tc_name, state=result_state, mutating=mutation)
                 emit({"type": "tool_result", "id": req_id, "call_id": tc["id"],
                       "output": output, "error": is_error,
-                      "state": "FAILED" if is_error else "COMPLETED"})
+                      "state": result_state})
 
                 api_messages.append({
                     "role": "tool",
@@ -771,17 +861,42 @@ async def main() -> None:
             cmd = req.get("cmd")
 
             if cmd == "preview_cloud":
-                prepared = await asyncio.to_thread(
-                    lambda: _build_cloud_body(
-                        _inject_context(list(req.get("messages", []))),
-                        req.get("model", "deepseek-v4-flash"),
-                        req.get("thinking", False),
-                    )
+                messages = list(req.get("messages", []))
+                objective = next(
+                    (m.get("content", "") for m in reversed(messages)
+                     if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                    "",
                 )
+                route, plan = ORCHESTRATOR.prepare(objective)
+                emit({"type": "orchestration", "id": req["id"],
+                      **ORCHESTRATOR.event(route, plan)})
+                research_only = (route.needs_web_research and not route.needs_action
+                                 and not route.needs_memory)
+                if research_only:
+                    preview_body = research_helper.build_query_body(
+                        objective, req.get("model", "deepseek-v4-flash")
+                    )
+                    prepared = {
+                        "_atlas_kind": "research",
+                        "question": objective,
+                        "model": req.get("model", "deepseek-v4-flash"),
+                        "messages": messages,
+                        "preview_body": preview_body,
+                    }
+                    visible_payload = preview_body
+                else:
+                    prepared = await asyncio.to_thread(
+                        lambda: _build_cloud_body(
+                            _inject_context(messages),
+                            req.get("model", "deepseek-v4-flash"),
+                            req.get("thinking", False),
+                        )
+                    )
+                    visible_payload = prepared
                 token = cloud_previews.issue(req["id"], prepared)
                 emit({
                     "type": "cloud_preview", "id": req["id"], "token": token,
-                    "payload": json.dumps(prepared, ensure_ascii=False, indent=2),
+                    "payload": json.dumps(visible_payload, ensure_ascii=False, indent=2),
                     "expires_in_seconds": cloud_previews.ttl_seconds,
                 })
 
@@ -799,17 +914,25 @@ async def main() -> None:
                     except (asyncio.CancelledError, asyncio.TimeoutError):
                         pass
                 cancel_event = asyncio.Event()
-                active_task = asyncio.create_task(
-                    agent_loop(
-                        req["id"],
-                        [],
-                        req.get("model", "deepseek-v4-flash"),
-                        req.get("thinking", False),
-                        cancel_event,
-                        approvals,
-                        prepared,
+                if prepared.get("_atlas_kind") == "research":
+                    active_task = asyncio.create_task(
+                        research_helper.research_pipeline(
+                            req["id"], prepared["question"], prepared["model"], cancel_event,
+                            prepared.get("messages"),
+                        )
                     )
-                )
+                else:
+                    active_task = asyncio.create_task(
+                        agent_loop(
+                            req["id"],
+                            [],
+                            req.get("model", "deepseek-v4-flash"),
+                            req.get("thinking", False),
+                            cancel_event,
+                            approvals,
+                            prepared,
+                        )
+                    )
 
             elif cmd == "discard_cloud_preview":
                 cloud_previews.discard(req.get("token", ""))

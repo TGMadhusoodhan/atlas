@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from tool_policy import ApprovalBroker, parse_tool_arguments, requires_approval
+from tool_policy import ApprovalBroker, is_mutating, parse_tool_arguments, requires_approval
 
 
 class ToolPolicyTest(unittest.IsolatedAsyncioTestCase):
@@ -9,11 +9,17 @@ class ToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Malformed tool arguments"):
             parse_tool_arguments('{"target":')
 
-    def test_read_only_and_mutating_tools_are_separate(self):
+    def test_mutations_run_without_an_approval_gate(self):
         self.assertFalse(requires_approval("read_file", {"path": "/tmp/x"}))
-        self.assertTrue(requires_approval("lockdown_start", {}))
+        self.assertFalse(requires_approval("git_status", {"repo": "~/atlas"}))
+        self.assertFalse(requires_approval("lockdown_start", {}))
+        self.assertFalse(requires_approval("open_app", {"app": "spotify"}))
+        self.assertFalse(requires_approval("run_command", {"argv": ["date"]}))
+        self.assertFalse(requires_approval("bash", {"command": "date"}))
         self.assertFalse(requires_approval("memory_forget", {"confirm": False}))
-        self.assertTrue(requires_approval("memory_forget", {"confirm": True}))
+        self.assertFalse(requires_approval("memory_forget", {"confirm": True}))
+        self.assertTrue(is_mutating("open_app", {"app": "spotify"}))
+        self.assertFalse(is_mutating("read_file", {"path": "/tmp/x"}))
 
     async def test_approval_is_scoped_and_consumed_once(self):
         broker = ApprovalBroker(timeout_seconds=1)

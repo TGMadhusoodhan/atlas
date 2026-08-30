@@ -61,6 +61,39 @@ Cost remains unknown unless current rates are explicitly configured with
 `ATLAS_INPUT_USD_PER_MILLION_TOKENS` and
 `ATLAS_OUTPUT_USD_PER_MILLION_TOKENS`.
 
+### Desktop tools
+
+The agent prefers typed tools over shell commands. Tool families cover applications and
+Hyprland windows/workspaces, home-directory file operations, Wayland clipboard, audio and
+brightness, notifications, Git, terminal/command execution, browser launch/search,
+session locking, and power controls. `run_command` accepts an argv array without shell
+parsing; `bash` is retained as an explicit power-user fallback.
+
+Tools run immediately without a separate per-action approval prompt. File and Git paths
+remain constrained to the user's home directory. `browser_current_page` can report the
+active browser window title, but not its URL without a browser integration.
+
+Typed actions return a machine-readable verification envelope with `state`, `action`,
+`verification`, `attempts`, and command `output`. Observable actions verify their real
+postcondition (for example, Hyprland window presence/focus/position, clipboard read-back,
+volume/brightness read-back, filesystem state, or changed Git HEAD). A failed app launch
+gets one bounded executable fallback. Requests whose final state cannot be observed are
+reported as `DISPATCHED`, not success. The shared prompt requires the agent to use this
+evidence in an action → verify → retry or report-failure loop.
+
+### Internal ATLAS architecture
+
+The desktop exposes one assistant: ATLAS. An internal intent router classifies each
+request, then a planner assigns work to the Researcher, Memory Manager, and Executor as
+needed. The Verifier is the completion gate: action answers are withheld until tool
+evidence is verified, failed actions receive a bounded retry, and unobservable outcomes
+are labeled `DISPATCHED`. Web research is selected automatically, so there is no agent
+or research-mode picker in the UI.
+
+```text
+ATLAS → Intent Router → Planner → Researcher / Memory Manager / Executor → Verifier
+```
+
 ## Mobile quick start
 
 Open `mobile/` in Android Studio and run on a device. It works immediately on the

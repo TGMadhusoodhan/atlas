@@ -122,6 +122,22 @@ def delete(ids: list[str]) -> int:
         return 0
 
 
+def existing_ids(ids: list[str]) -> set[str]:
+    """Return the requested memory IDs that still exist (verification helper)."""
+    wanted = [item for item in (ids or []) if item]
+    if not wanted:
+        return set()
+    col = _ensure()
+    if col is None:
+        return set(wanted)  # fail closed: absence could not be verified
+    try:
+        result = col.get(ids=wanted, include=[])
+        return set(result.get("ids") or [])
+    except Exception as exc:
+        _log(f"verification failed: {exc}")
+        return set(wanted)
+
+
 def clear() -> int:
     """Wipe ALL memories. Returns the number removed."""
     col = _ensure()

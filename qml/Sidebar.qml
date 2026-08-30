@@ -7,7 +7,6 @@ Item {
     // ── Signals to shell.qml ──────────────────────────────────────────────────
     signal animationHidden()
     signal sendMessage(var messages, string model, bool thinking, string reqId)
-    signal sendResearch(string question, string model, string reqId)
     signal cancelMessage(string reqId)
     signal saveSession(var messages, var apiMessages, string sessionId)
     signal requestLoadLast()
@@ -34,7 +33,6 @@ Item {
     property bool   thinkingMode:     false
     property string activeModel:      ""
     property string currentSessionId: ""
-    property bool   researchMode:     false
     property var    pendingApproval:  null
     property var    pendingCloudPreview: null
 
@@ -81,6 +79,10 @@ Item {
             case "transcribing": root.status = "thinking";   root.statusMsg = "Transcribing…"; break
             case "thinking":     root.status = "thinking";   root.statusMsg = "Thinking…";     break
             case "speaking":     root.status = "streaming";  root.statusMsg = "Speaking…";     break
+            case "awaiting_confirmation":
+                root.status = "awaiting_confirmation"
+                root.statusMsg = "Waiting for spoken confirmation…"
+                break
             default:             root.status = "idle";       root.statusMsg = "";              break
             }
             break
@@ -110,6 +112,15 @@ Item {
         case "progress":
             root.status = "research"
             root.statusMsg = ev.detail || ev.step || ""
+            break
+
+        case "orchestration":
+            root.status = "thinking"
+            root.statusMsg = (ev.agents || []).join(" → ")
+            break
+
+        case "verification":
+            root.statusMsg = "Verifier: " + (ev.outcome || "checking")
             break
 
         case "tool_call": {
@@ -212,11 +223,6 @@ Item {
     }
 
     // ── Actions ───────────────────────────────────────────────────────────────
-    readonly property var systemPrompt: [{
-        role: "system",
-        content: "You are a private desktop assistant with read-only access to files inside explicitly configured knowledge roots. You do not have shell, file-write, or unrestricted system access. Every available mutation requires the user's explicit one-time approval before execution. Never claim a tool ran unless its result says it completed.\n\nSystem: Arch Linux, Hyprland desktop.\n\nFocus/Lockdown mode: lockdown_status is read-only. lockdown_start, lockdown_exception, and lockdown_end are mutations and require confirmation. Ask one concise clarifying question for missing focus target, supporting apps, duration, and monitor choice before proposing lockdown_start."
-    }]
-
     function submit(text) {
         if (!text.trim() || root.isStreaming) return
         var userMsg = { role: "user", content: text.trim() }
@@ -230,18 +236,12 @@ Item {
         root.statusMsg = ""
         root.activeReqId = Date.now().toString()
 
-        if (root.researchMode) {
-            root.status = "research"
-            root.statusMsg = "Generating search query..."
-            root.sendResearch(text.trim(), root.selectedModel, root.activeReqId)
-        } else {
-            root.status = "thinking"
-            var api = root.apiMessages.slice()
-            api.push(userMsg)
-            root.apiMessages = api
-            root.previewCloud(root.systemPrompt.concat(api), root.selectedModel,
-                              root.thinkingMode, root.activeReqId)
-        }
+        root.status = "thinking"
+        var api = root.apiMessages.slice()
+        api.push(userMsg)
+        root.apiMessages = api
+        root.previewCloud(api, root.selectedModel, root.thinkingMode,
+                          root.activeReqId)
     }
 
     function newChat() {
@@ -343,10 +343,8 @@ Item {
             InputBar {
                 Layout.fillWidth: true
                 isStreaming:  root.isStreaming
-                researchMode: root.researchMode
                 onSubmit: text => root.submit(text)
                 onStop:   root.cancelMessage(root.activeReqId)
-                onToggleResearch: root.researchMode = !root.researchMode
             }
         }
 

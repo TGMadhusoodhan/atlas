@@ -14,7 +14,6 @@ ShellRoot {
     }
 
     readonly property string helperPath:   root.resolvePath("helper/ai_helper.py")
-    readonly property string researchPath: root.resolvePath("helper/research_helper.py")
     readonly property string voicePath:    root.resolvePath("voice/voice_helper.py")
     readonly property string pythonPath:   root.resolvePath("venv/bin/python3")
 
@@ -49,35 +48,6 @@ ShellRoot {
     Timer { id: chatRestartTimer;     interval: 1000; onTriggered: aiProc.running = true }
 
     // ── Research helper ───────────────────────────────────────────────────────
-    Process {
-        id: researchProc
-        stdinEnabled: true
-        command: [root.pythonPath, root.researchPath]
-        running: true
-
-        stdout: SplitParser {
-            splitMarker: "\n"
-            onRead: data => {
-                var line = data.trim()
-                if (!line) return
-                try { sidebar.handleEvent(JSON.parse(line)) }
-                catch (e) { console.warn("[ai-sidebar] research event error:", e, data) }
-            }
-        }
-        stderr: SplitParser {
-            splitMarker: "\n"
-            onRead: data => console.warn("[ai-sidebar/research]", data)
-        }
-        onRunningChanged: {
-            if (!running) {
-                console.warn("[ai-sidebar] research helper exited, restarting…")
-                researchRestartTimer.start()
-            }
-        }
-    }
-
-    Timer { id: researchRestartTimer; interval: 1000; onTriggered: researchProc.running = true }
-
     // ── Voice helper (push-to-talk STT + spoken replies) ───────────────────────
     Process {
         id: voiceProc
@@ -109,7 +79,6 @@ ShellRoot {
     Timer { id: voiceRestartTimer; interval: 1000; onTriggered: voiceProc.running = true }
 
     function send(obj)         { aiProc.write(JSON.stringify(obj) + "\n") }
-    function sendResearchCmd(obj) { researchProc.write(JSON.stringify(obj) + "\n") }
     function sendVoiceCmd(obj) { voiceProc.write(JSON.stringify(obj) + "\n") }
 
     // ── IPC ───────────────────────────────────────────────────────────────────
@@ -163,14 +132,8 @@ ShellRoot {
                              messages: messages, model: model, thinking: thinking })
             }
 
-            onSendResearch: (question, model, reqId) => {
-                root.sendResearchCmd({ cmd: "research", id: reqId,
-                                       question: question, model: model })
-            }
-
             onCancelMessage: reqId => {
                 root.send({ cmd: "cancel", id: reqId })
-                root.sendResearchCmd({ cmd: "cancel", id: reqId })
             }
 
             onSaveSession: (messages, apiMessages, sessionId) => {

@@ -8,16 +8,19 @@ import json
 from dataclasses import dataclass
 from collections.abc import Callable
 
+from desktop_tools import READ_ONLY_DESKTOP_TOOLS, MUTATING_DESKTOP_TOOLS
+
 READ_ONLY_TOOLS = frozenset({
     "read_file", "list_dir", "lockdown_status", "knowledge_search",
     "knowledge_list", "memory_search",
-})
+}) | READ_ONLY_DESKTOP_TOOLS
 MUTATING_TOOLS = frozenset({
     "lockdown_start", "lockdown_exception", "lockdown_end", "remember_fact",
-})
+}) | MUTATING_DESKTOP_TOOLS
 
 
-def requires_approval(name: str, args: dict) -> bool:
+def is_mutating(name: str, args: dict) -> bool:
+    """Return whether a known tool call changes state."""
     if name in READ_ONLY_TOOLS:
         return name in {"memory_forget", "forget_fact"} and bool(args.get("confirm"))
     if name in MUTATING_TOOLS:
@@ -25,6 +28,16 @@ def requires_approval(name: str, args: dict) -> bool:
     if name in {"memory_forget", "forget_fact"}:
         return bool(args.get("confirm"))
     raise ValueError(f"Unknown tool: {name}")
+
+
+def requires_approval(name: str, args: dict) -> bool:
+    """Validate a tool call and return the configured approval requirement.
+
+    ATLAS currently runs requested mutations immediately; verification remains
+    mandatory after execution.
+    """
+    is_mutating(name, args)
+    return False
 
 
 def parse_tool_arguments(raw: str) -> dict:

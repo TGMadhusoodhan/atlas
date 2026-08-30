@@ -46,6 +46,12 @@ PYTHON    = HOME / "atlas/venv/bin/python3"
 AI_HELPER = HOME / "atlas/helper/ai_helper.py"
 CONFIG    = HOME / ".config/ai-sidebar/voice.toml"
 
+HELPER_DIR = Path(__file__).resolve().parents[1] / "helper"
+if str(HELPER_DIR) not in sys.path:
+    sys.path.insert(0, str(HELPER_DIR))
+
+from capabilities import system_prompt
+
 DEFAULT_CONFIG = """\
 # ATLAS voice helper config
 [stt]
@@ -74,27 +80,7 @@ model    = "deepseek-v4-flash"
 thinking = false
 """
 
-SYSTEM_PROMPT = {
-    "role": "system",
-    "content": (
-        "You are ATLAS — which stands for Always There, Listening and Serving — a voice "
-        "assistant on the user's Arch Linux / Hyprland machine (home: /home/MadhuArch). You "
-        "can run shell commands, read/write files, and control focus/lockdown and media with "
-        "your tools — use them proactively, never refuse. If asked your name or what it means, "
-        "say it stands for Always There, Listening and Serving.\n\n"
-        "BE HONEST about your capabilities. NEVER invent tools, apps, features, or databases you "
-        "don't have — there is no 'reminders system' or named 'database'. If a request can be done "
-        "with your real tools (bash, files), actually do it: e.g. for reminders/alarms use `at`, "
-        "systemd timers, or a notes file with notify-send. If you genuinely can't do something, "
-        "say so in one short honest line — don't make up a fake system or result.\n\n"
-        "This is a spoken conversation. Talk like you're texting a friend, out loud:\n"
-        "- Reply in ONE short sentence. Two only if truly needed. Never long-winded.\n"
-        "- Answer directly first. Don't restate the question or narrate what you're doing.\n"
-        "- Contractions, casual. No markdown, lists, code, tables, emoji, or headings — it's read aloud.\n"
-        "- Summarize numbers/paths/URLs instead of spelling them out.\n"
-        "- If something needs detail, give the one-line version and offer to go deeper."
-    ),
-}
+SYSTEM_PROMPT = system_prompt("voice")
 
 
 # ── stdout events + logging + notifications ───────────────────────────────────
@@ -192,9 +178,10 @@ def _pop_sentences(buf: str) -> tuple[list[str], str]:
 
 # ── ai_helper.py client (streaming, single-flight, cancellable) ───────────────
 class AIHelper:
-    def __init__(self, model: str, thinking: bool):
+    def __init__(self, model: str, thinking: bool, approval_handler=None):
         self.model = model
         self.thinking = thinking
+        self._approval_handler = approval_handler
         self.api_messages: list[dict] = []
         self._req = 0
         self._cur_id: str | None = None
@@ -224,6 +211,19 @@ class AIHelper:
             except Exception:
                 pass
 
+    def _resolve_tool_approval(self, req_id: str, ev: dict) -> None:
+        approved = False
+        if self._approval_handler is not None:
+            approved = bool(self._approval_handler(ev))
+        self._send({
+            "cmd": "tool_approval",
+            "id": req_id,
+            "call_id": ev.get("call_id", ""),
+            "name": ev.get("name", ""),
+            "arguments": ev.get("arguments", {}),
+            "approved": approved,
+        })
+
     def ask_stream(self, text: str):
         """Yield the reply sentence-by-sentence as it streams. Single-flight."""
         with self._lock:
@@ -252,6 +252,8 @@ class AIHelper:
                     if t == "cloud_preview":
                         self._send({"cmd": "chat_approved", "id": req_id,
                                     "token": ev.get("token", "")})
+                    elif t == "tool_approval_required":
+                        self._resolve_tool_approval(req_id, ev)
                     elif t == "token":
                         tok = ev.get("text", "")
                         buf += tok
@@ -414,14 +416,18 @@ class VoiceSession:
         self.cfg = cfg
         self._recorder = None
         self._tts: PiperTTS | None = None
+        self._approval_pending = threading.Event()
+        self._approval_utterances: queue.Queue = queue.Queue()
         self._ai = AIHelper(
             model=cfg_get(cfg, "ai", "model", default="deepseek-v4-flash"),
             thinking=bool(cfg_get(cfg, "ai", "thinking", default=False)),
+            approval_handler=self._handle_tool_approval,
         )
         self._active = False
         self._run_lock = threading.Lock()
         self._models_lock = threading.Lock()
         self._user_speaking = False
+        self._recording_started_during_tts = False
         self._utterances: queue.Queue = queue.Queue()
         self._listener_thread: threading.Thread | None = None
         self._silence_timeout = float(cfg_get(cfg, "convo", "silence_timeout", default=6.0))
@@ -432,6 +438,7 @@ class VoiceSession:
     def _on_recording_start(self) -> None:
         self._user_speaking = True
         speaking = bool(self._tts and self._tts.speaking)
+        self._recording_started_during_tts = speaking
         log(f"VAD: speech started (tts.speaking={speaking})")
         if self._barge_in and speaking:
             age = time.monotonic() - self._tts.started_at
@@ -493,6 +500,8 @@ class VoiceSession:
                 log("recorder.text() error:", e)
                 break
             self._user_speaking = False   # text() returned → this utterance is complete
+            started_during_tts = self._recording_started_during_tts
+            self._recording_started_during_tts = False
             if not self._active:
                 break
             text = (text or "").strip()
@@ -500,19 +509,80 @@ class VoiceSession:
                 # Half-duplex echo suppression: if barge-in is off, ignore anything
                 # captured while ATLAS is speaking — it's almost certainly ATLAS's own
                 # voice coming back through the mic, not the user.
-                if not self._barge_in and self._tts and self._tts.speaking:
+                if not self._barge_in and started_during_tts:
                     log(f"ignored (echo while speaking): {text!r}")
                     continue
                 log(f"heard utterance: {text!r}")
-                self._utterances.put(text)
+                if self._approval_pending.is_set():
+                    self._approval_utterances.put(text)
+                else:
+                    self._utterances.put(text)
         log("listener thread exited")
 
-    def _drain_utterances(self) -> None:
+    @staticmethod
+    def _approval_prompt(ev: dict) -> str:
+        name = ev.get("name", "")
+        args = ev.get("arguments") or {}
+        if name == "lockdown_start":
+            minutes = max(1, round(int(args.get("duration_seconds", 0)) / 60))
+            target = str(args.get("primary_target") or "your focus session")
+            allowed = [str(x) for x in args.get("allowed_apps", [])]
+            allowed += [str(x) for x in args.get("allowed_domains", [])]
+            suffix = f" allowing {', '.join(allowed)}" if allowed else ""
+            return f"Start a {minutes}-minute lockdown for {target}{suffix}? Say yes or no."
+        summary = str(ev.get("inputText") or name.replace("_", " "))
+        return f"Approve this action: {summary}? Say yes or no."
+
+    @staticmethod
+    def _approval_answer(text: str) -> bool | None:
+        answer = re.sub(r"[^a-z\s]", "", text.lower()).strip()
+        if answer in {"yes", "yes please", "yeah", "yep", "confirm", "approve",
+                      "do it", "go ahead", "ok", "okay", "sure"}:
+            return True
+        if answer in {"no", "nope", "cancel", "reject", "dont", "do not",
+                      "never mind", "nevermind"}:
+            return False
+        return None
+
+    def _handle_tool_approval(self, ev: dict) -> bool:
+        """Ask for spoken consent while keeping the exact backend call pending."""
+        self._approval_pending.set()
+        self._drain_queue(self._approval_utterances)
+        try:
+            state("awaiting_confirmation")
+            prompt = self._approval_prompt(ev)
+            log(f"approval requested: {ev.get('name')} {ev.get('arguments')!r}")
+            self._tts.speak_sync(prompt)
+            state("listening")
+
+            timeout = max(1.0, float(ev.get("expires_in_seconds", 120)) - 5.0)
+            deadline = time.monotonic() + timeout
+            while self._active and time.monotonic() < deadline:
+                try:
+                    answer = self._approval_utterances.get(
+                        timeout=max(0.01, min(0.2, deadline - time.monotonic())))
+                except queue.Empty:
+                    continue
+                decision = self._approval_answer(answer)
+                log(f"approval response: {answer!r} -> {decision}")
+                if decision is not None:
+                    state("thinking")
+                    return decision
+                self._tts.speak_sync("Please say yes or no.")
+            return False
+        finally:
+            self._approval_pending.clear()
+
+    @staticmethod
+    def _drain_queue(items: queue.Queue) -> None:
         try:
             while True:
-                self._utterances.get_nowait()
+                items.get_nowait()
         except queue.Empty:
             pass
+
+    def _drain_utterances(self) -> None:
+        self._drain_queue(self._utterances)
 
     def _next_utterance(self, timeout: float | None = None) -> str | None:
         """Return the next user utterance, or None if they've gone quiet.
