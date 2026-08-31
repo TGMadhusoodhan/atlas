@@ -1,4 +1,3 @@
-import subprocess
 import json
 import tempfile
 import unittest
@@ -22,6 +21,7 @@ EXPECTED_TOOLS = {
     "send_notification", "git_status", "git_commit", "git_diff",
     "launch_terminal", "run_command", "browser_open", "browser_search",
     "browser_current_page", "lock_computer", "shutdown", "restart", "bash",
+    "get_desktop_context",
 }
 
 
@@ -69,7 +69,7 @@ class DesktopToolBoundaryTest(unittest.TestCase):
         output, failed = execute("run_command", {"argv": ["printf", "%s", "hello"]})
 
         self.assertFalse(failed, output)
-        self.assertEqual(json.loads(output)["state"], "VERIFIED")
+        self.assertEqual(json.loads(output)["state"], "COMMAND_COMPLETED")
         argv, = run.call_args.args
         self.assertEqual(argv, ["printf", "%s", "hello"])
         self.assertNotIn("shell", run.call_args.kwargs)
@@ -124,6 +124,62 @@ class DesktopToolBoundaryTest(unittest.TestCase):
         self.assertTrue(failed)
         self.assertEqual(result["state"], "FAILED")
         self.assertIn("did not match", result["verification"])
+
+    @patch("desktop_tools.desktop_context.get_snapshot")
+    @patch("desktop_tools._run")
+    def test_exact_window_moves_to_workspace_and_verifies(self, run, snapshot):
+        window = {"address": "0xabc", "class": "code",
+                  "workspace": {"id": 2, "name": "2"}}
+        moved = {**window, "workspace": {"id": 3, "name": "3"}}
+        snapshot.side_effect = [
+            {"active_window": window, "windows": [window]},
+            {"active_window": moved, "windows": [moved]},
+        ]
+        run.return_value = ("ok", False)
+
+        output, failed = execute("move_window", {
+            "window_address": "0xabc", "workspace": 3,
+        })
+
+        self.assertFalse(failed, output)
+        self.assertEqual(json.loads(output)["state"], "VERIFIED")
+        run.assert_called_once_with([
+            "hyprctl", "dispatch", "movetoworkspacesilent", "3,address:0xabc",
+        ])
+
+    @patch("desktop_tools.subprocess.run")
+    def test_hyprctl_text_error_is_not_treated_as_success(self, run):
+        run.return_value = Mock(stdout="Invalid workspace", stderr="", returncode=0)
+        output, failed = desktop_tools._run(["hyprctl", "dispatch", "workspace", "bad"])
+        self.assertTrue(failed, output)
+
+    @patch("desktop_tools.time.sleep", return_value=None)
+    @patch("desktop_tools._run")
+    def test_media_verification_polls_for_async_state_change(self, run, sleep):
+        run.side_effect = [
+            ("Playing", False),
+            ("ok", False),
+            ("Playing", False),
+            ("Paused", False),
+        ]
+        output, failed = execute("play_pause", {"player": "spotify"})
+        result = json.loads(output)
+        self.assertFalse(failed, output)
+        self.assertEqual(result["state"], "VERIFIED")
+        self.assertEqual(result["attempts"], 2)
+
+    @patch("desktop_tools.desktop_context.get_snapshot")
+    def test_ambiguous_context_blocks_destructive_window_action(self, snapshot):
+        snapshot.return_value = {
+            "active_window": {"address": None},
+            "windows": [
+                {"address": "0x1", "class": "code"},
+                {"address": "0x2", "class": "code"},
+            ],
+        }
+        output, failed = execute("close_app", {"app": "code"})
+        self.assertTrue(failed)
+        self.assertIn("ambiguous", output)
 
 
 if __name__ == "__main__":

@@ -43,7 +43,8 @@ class IntentRouter:
     _ACTION = re.compile(
         r"\b(open|close|focus|move|rename|switch|set|play|pause|launch|run|commit|"
         r"lock|shutdown|restart|reboot|start|stop|delete|remove|copy|send|notify|"
-        r"notification|remember|forget)\b", re.I)
+        r"notification|remember|forget|fix|change|ensure|configure|install|update|"
+        r"create|build|repair|write)\b", re.I)
     _RESEARCH = re.compile(
         r"\b(research|investigate|look up|search|latest|current|today|news|sources?|"
         r"documentation|docs|compare|fact.?check)\b", re.I)
@@ -75,7 +76,7 @@ class Planner:
                                   "Relevant evidence is available to the executor"))
         if route.needs_memory:
             steps.append(PlanStep("Memory Manager", "Retrieve or propose durable memory changes",
-                                  "Memory is relevant and writes remain approval-gated"))
+                                  "Memory is relevant and mutations follow their permission class"))
         if route.needs_action:
             steps.append(PlanStep("Executor", "Use the narrowest typed tools needed",
                                   "Each requested state change has a tool result"))
@@ -98,8 +99,13 @@ class MemoryManager:
 
 
 class Verifier:
-    def __init__(self, route: Route):
+    _POSTCONDITION = re.compile(
+        r"\b(fix|change|ensure|configure|install|update|create|build|repair|write|"
+        r"delete|remove|move|rename)\b", re.I)
+
+    def __init__(self, route: Route, objective: str = ""):
         self.route = route
+        self.objective = objective
         self.results: list[dict] = []
 
     def record(self, *, name: str, state: str, mutating: bool) -> None:
@@ -114,6 +120,25 @@ class Verifier:
                     "No state-changing tool evidence exists. Execute the requested action; do not claim success.",
                 )
             latest_by_action = {result["name"]: result for result in actions}
+            completed_commands = [result for result in actions
+                                  if result["state"] == "COMMAND_COMPLETED"]
+            if completed_commands:
+                if not self._POSTCONDITION.search(self.objective):
+                    return VerificationAssessment(
+                        True, "COMMAND_COMPLETED",
+                        "The requested command completed successfully; do not broaden this into a claim about an unobserved objective.",
+                    )
+                last_command_index = max(self.results.index(result)
+                                         for result in completed_commands)
+                observed_after = any(
+                    not result["mutating"] and result["state"] not in {"FAILED", "COMMAND_COMPLETED"}
+                    for result in self.results[last_command_index + 1:]
+                )
+                if not observed_after:
+                    return VerificationAssessment(
+                        False, "COMMAND_COMPLETED",
+                        "The command exited successfully, but the objective needs a follow-up observation before success can be claimed.",
+                    )
             failures = [result for result in latest_by_action.values()
                         if result["state"] == "FAILED"]
             if failures:

@@ -11,6 +11,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+import desktop_context
+
 HOME = Path.home().resolve()
 MAX_OUTPUT = 8_000
 
@@ -34,9 +36,9 @@ def _tool(name: str, description: str, properties: dict, required: list[str] | N
 S = {"type": "string"}
 DESKTOP_TOOLS = [
     _tool("open_app", "Launch an installed desktop application by command or desktop ID.", {"app": S}, ["app"]),
-    _tool("close_app", "Close windows whose Hyprland class matches an application name.", {"app": S}, ["app"]),
-    _tool("focus_window", "Focus a window by its Hyprland class.", {"window_class": S}, ["window_class"]),
-    _tool("move_window", "Move a window to exact desktop coordinates.", {"window_class": S, "x": {"type": "integer"}, "y": {"type": "integer"}}, ["window_class", "x", "y"]),
+    _tool("close_app", "Close a window by exact Hyprland address when known, otherwise by class. Omit both to target the active window.", {"app": S, "window_address": S}),
+    _tool("focus_window", "Focus a window by exact Hyprland address when known, otherwise by class.", {"window_class": S, "window_address": S}),
+    _tool("move_window", "Move a window to a workspace or exact coordinates. Prefer window_address for contextual actions; omit the target to use the active window.", {"window_class": S, "window_address": S, "workspace": {"oneOf": [{"type": "integer"}, S]}, "x": {"type": "integer"}, "y": {"type": "integer"}}),
     _tool("switch_workspace", "Switch to a numbered or named Hyprland workspace.", {"workspace": {"oneOf": [{"type": "integer"}, S]}}, ["workspace"]),
     _tool("find_file", "Find files by a case-insensitive name fragment under the user's home directory.", {"query": S, "path": S}, ["query"]),
     _tool("open_file", "Open a file under the user's home directory with its default application.", {"path": S}, ["path"]),
@@ -45,7 +47,7 @@ DESKTOP_TOOLS = [
     _tool("get_clipboard", "Read the current Wayland clipboard text.", {}, []),
     _tool("set_clipboard", "Replace the Wayland clipboard text.", {"text": S}, ["text"]),
     _tool("set_volume", "Set the default audio output volume percentage from 0 to 150.", {"percent": {"type": "integer", "minimum": 0, "maximum": 150}}, ["percent"]),
-    _tool("play_pause", "Toggle playback on the active MPRIS media player.", {}, []),
+    _tool("play_pause", "Toggle playback on a specific MPRIS player, or the currently active player when omitted.", {"player": S}, []),
     _tool("set_brightness", "Set display brightness percentage from 1 to 100.", {"percent": {"type": "integer", "minimum": 1, "maximum": 100}}, ["percent"]),
     _tool("send_notification", "Send a desktop notification.", {"title": S, "body": S}, ["title"]),
     _tool("git_status", "Show Git status for a repository under the user's home directory.", {"repo": S}, ["repo"]),
@@ -56,6 +58,7 @@ DESKTOP_TOOLS = [
     _tool("browser_open", "Open an HTTP or HTTPS URL in the default browser.", {"url": S}, ["url"]),
     _tool("browser_search", "Search the web in the default browser.", {"query": S}, ["query"]),
     _tool("browser_current_page", "Return visible metadata for the active browser window; URLs are unavailable without browser integration.", {}, []),
+    _tool("get_desktop_context", "Read normalized active-window, workspace, monitor, open-window, media, and development-project context.", {"refresh": {"type": "boolean"}}, []),
     _tool("lock_computer", "Lock the current login session.", {}, []),
     _tool("shutdown", "Power off the computer.", {}, []),
     _tool("restart", "Restart the computer.", {}, []),
@@ -64,6 +67,7 @@ DESKTOP_TOOLS = [
 
 READ_ONLY_DESKTOP_TOOLS = frozenset({
     "find_file", "get_clipboard", "git_status", "git_diff", "browser_current_page",
+    "get_desktop_context",
 })
 MUTATING_DESKTOP_TOOLS = frozenset(
     tool["function"]["name"] for tool in DESKTOP_TOOLS
@@ -98,7 +102,9 @@ def _run(argv: list[str], *, cwd: Path | None = None, input_text: str | None = N
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"{type(exc).__name__}: {exc}", True
     output = (result.stdout + result.stderr).strip() or f"Completed with exit code {result.returncode}"
-    return output[:MAX_OUTPUT], result.returncode != 0
+    hypr_error = bool(argv and argv[0] == "hyprctl" and
+                      re.search(r"(^|\n)\s*(invalid|error)", output, re.I))
+    return output[:MAX_OUTPUT], result.returncode != 0 or hypr_error
 
 
 def _launch(argv: list[str]) -> tuple[str, bool]:
@@ -134,7 +140,7 @@ def result_state(output: str, failed: bool) -> str:
         return "FAILED"
     try:
         state = json.loads(output).get("state")
-        return state if state in {"VERIFIED", "DISPATCHED", "FAILED"} else "VERIFIED"
+        return state if state in {"VERIFIED", "DISPATCHED", "FAILED", "COMMAND_COMPLETED"} else "VERIFIED"
     except (json.JSONDecodeError, AttributeError):
         return "VERIFIED"
 
@@ -157,6 +163,46 @@ def _window_matches(app: str) -> list[dict]:
     return [window for window in clients if pattern.search(str(window.get("class", "")))]
 
 
+def _selector(args: dict, class_key: str = "window_class") -> str:
+    address = str(args.get("window_address") or "").strip()
+    if address:
+        if not re.fullmatch(r"0x[0-9a-fA-F]+", address):
+            raise ValueError("Invalid Hyprland window address")
+        return f"address:{address}"
+    app = args.get("app") or args.get(class_key)
+    if app:
+        token = _token(app, "window class")
+        return f"class:^({re.escape(token)})$"
+    active = desktop_context.get_snapshot(refresh=True).get("active_window", {})
+    address = str(active.get("address") or "")
+    if not address:
+        raise ValueError("No active window is available; specify a window")
+    return f"address:{address}"
+
+
+def _window_for_args(args: dict) -> dict | None:
+    snapshot = desktop_context.get_snapshot(refresh=True)
+    address = str(args.get("window_address") or "")
+    if address:
+        return next((window for window in snapshot["windows"]
+                     if window.get("address") == address), None)
+    wanted = str(args.get("app") or args.get("window_class") or "")
+    if wanted:
+        matches = [window for window in snapshot["windows"]
+                   if re.search(re.escape(wanted), str(window.get("class") or ""), re.I)]
+        return matches[0] if len(matches) == 1 else None
+    return snapshot.get("active_window")
+
+
+def _terminal_cwd(args: dict) -> Path:
+    cwd_arg = args.get("cwd")
+    if not cwd_arg:
+        developer = desktop_context.get_snapshot(refresh=True)["developer"]
+        if developer.get("confidence") == "high":
+            cwd_arg = developer.get("project")
+    return _path(cwd_arg, must_exist=True)
+
+
 def _poll(check, attempts: int = 10, delay: float = 0.2):
     for attempt in range(1, attempts + 1):
         evidence = check()
@@ -168,6 +214,11 @@ def _poll(check, attempts: int = 10, delay: float = 0.2):
 
 
 def _capture_before(name: str, args: dict):
+    if name in {"close_app", "focus_window", "move_window"}:
+        target = _window_for_args(args)
+        if target is None and name in {"close_app", "move_window"}:
+            raise ValueError("Window context is unavailable or ambiguous; specify an exact window")
+        return target
     if name == "move_file":
         source = _path(args.get("source"), must_exist=True)
         destination = _path(args.get("destination"))
@@ -176,14 +227,22 @@ def _capture_before(name: str, args: dict):
         source = _path(args.get("path"), must_exist=True)
         return source.with_name(str(args.get("new_name", "")))
     if name == "play_pause":
-        output, failed = _run(["playerctl", "status"])
+        player = str(args.get("player") or "").strip()
+        argv = ["playerctl"] + (["-p", player] if player else []) + ["status"]
+        output, failed = _run(argv)
         return None if failed else output.strip()
     if name == "git_commit":
         repo = _path(args.get("repo"), must_exist=True)
         output, failed = _run(["git", "rev-parse", "HEAD"], cwd=repo)
         return None if failed else output.strip()
     if name == "launch_terminal":
-        return len(_window_matches("kitty"))
+        snapshot = desktop_context.get_snapshot(refresh=True)
+        return {
+            "addresses": {window.get("address") for window in snapshot["windows"]
+                          if window.get("class") == "kitty"},
+            "workspace": snapshot["workspace"].get("name") or snapshot["workspace"].get("id"),
+            "cwd": str(_terminal_cwd(args)),
+        }
     return None
 
 
@@ -198,33 +257,44 @@ def _verify(name: str, args: dict, before, action_output: str) -> tuple[str, str
         return ("VERIFIED", evidence, attempts) if evidence else (
             "FAILED", "No matching Hyprland window appeared", attempts)
     if name == "close_app":
-        app = str(args["app"])
+        target = before
         evidence, attempts = _poll(
-            lambda: "Hyprland reports no matching windows" if not _window_matches(app) else None)
+            lambda: "Hyprland reports the exact window is closed" if
+            target and not any(window.get("address") == target.get("address")
+                               for window in desktop_context.get_snapshot(refresh=True)["windows"])
+            else None, attempts=20)
         return ("VERIFIED", evidence, attempts) if evidence else (
-            "FAILED", "A matching window is still present", attempts)
+            "FAILED", "The targeted window is still present or was ambiguous", attempts)
     if name == "focus_window":
-        wanted = str(args["window_class"])
+        target = before
         def focused():
-            active = _json_command(["hyprctl", "activewindow", "-j"])
-            if isinstance(active, dict) and re.search(re.escape(wanted), str(active.get("class", "")), re.I):
-                return f"Active window class is {active.get('class')}"
+            active = desktop_context.get_snapshot(refresh=True)["active_window"]
+            if target and active.get("address") == target.get("address"):
+                return f"Active window address is {active.get('address')}"
             return None
         evidence, attempts = _poll(focused)
         return ("VERIFIED", evidence, attempts) if evidence else (
             "FAILED", "Requested window did not become active", attempts)
     if name == "move_window":
-        wanted, x, y = str(args["window_class"]), int(args["x"]), int(args["y"])
+        target = before
         def moved():
-            matches = _window_matches(wanted)
-            for window in matches:
-                at = window.get("at")
-                if at == [x, y]:
-                    return f"Window coordinates are {at}"
+            current = _window_for_args({"window_address": target.get("address")}) if target else None
+            if current and "workspace" in args:
+                wanted = str(args["workspace"])
+                actual = str(current.get("workspace", {}).get("name") or
+                             current.get("workspace", {}).get("id"))
+                if actual == wanted:
+                    return f"Window workspace is {actual}"
+            if current and "x" in args and "y" in args:
+                raw = _json_command(["hyprctl", "clients", "-j"])
+                match = next((item for item in raw or []
+                              if item.get("address") == current.get("address")), None)
+                if match and match.get("at") == [int(args["x"]), int(args["y"])]:
+                    return f"Window coordinates are {match.get('at')}"
             return None
         evidence, attempts = _poll(moved)
         return ("VERIFIED", evidence, attempts) if evidence else (
-            "FAILED", f"Window did not reach [{x}, {y}]", attempts)
+            "FAILED", "Window did not reach the requested workspace/position", attempts)
     if name == "switch_workspace":
         wanted = str(args["workspace"])
         def switched():
@@ -253,10 +323,19 @@ def _verify(name: str, args: dict, before, action_output: str) -> tuple[str, str
         return ("VERIFIED", f"Volume read-back is {measured}%", 1) if valid else (
             "FAILED", f"Volume read-back was {measured}%", 1)
     if name == "play_pause":
-        after, failed = _run(["playerctl", "status"])
-        changed = not failed and before in {"Playing", "Paused"} and after.strip() != before
-        return ("VERIFIED", f"Player state changed from {before} to {after.strip()}", 1) if changed else (
-            "FAILED", f"Player state did not change (before={before}, after={after.strip()})", 1)
+        player = str(args.get("player") or "").strip()
+        argv = ["playerctl"] + (["-p", player] if player else []) + ["status"]
+        last_state = before
+        def changed():
+            nonlocal last_state
+            after, failed = _run(argv)
+            last_state = after.strip()
+            if not failed and before in {"Playing", "Paused"} and last_state != before:
+                return f"Player state changed from {before} to {last_state}"
+            return None
+        evidence, attempts = _poll(changed)
+        return ("VERIFIED", evidence, attempts) if evidence else (
+            "FAILED", f"Player state did not change (before={before}, after={last_state})", attempts)
     if name == "set_brightness":
         actual, failed = _run(["brightnessctl", "-m"])
         match = re.search(r",(\d+)%,", actual)
@@ -271,17 +350,28 @@ def _verify(name: str, args: dict, before, action_output: str) -> tuple[str, str
         return ("VERIFIED", f"Git HEAD changed from {before} to {after.strip()}", 1) if changed else (
             "FAILED", "Git HEAD did not change", 1)
     if name == "launch_terminal":
-        evidence, attempts = _poll(
-            lambda: f"Kitty window count increased to {count}" if
-            (count := len(_window_matches("kitty"))) > int(before or 0) else None)
+        def terminal_ready():
+            snapshot = desktop_context.get_snapshot(refresh=True)
+            new_windows = [window for window in snapshot["windows"]
+                           if window.get("class") == "kitty"
+                           and window.get("address") not in before["addresses"]]
+            for window in new_windows:
+                workspace = window.get("workspace", {}).get("name") or window.get("workspace", {}).get("id")
+                cwd_match = Path(before["cwd"]) in desktop_context.DesktopContextStore._process_cwds(
+                    window.get("pid"))
+                if str(workspace) == str(before["workspace"]) and cwd_match:
+                    return (f"New terminal {window.get('address')} is on workspace {workspace} "
+                            f"with cwd {before['cwd']}")
+            return None
+        evidence, attempts = _poll(terminal_ready, attempts=15)
         return ("VERIFIED", evidence, attempts) if evidence else (
-            "FAILED", "No new terminal window appeared", attempts)
+            "FAILED", "No new terminal appeared in the expected workspace/project", attempts)
     if name == "lock_computer":
         evidence, attempts = _poll(lambda: _locked_session_evidence())
         return ("VERIFIED", evidence, attempts) if evidence else (
             "FAILED", "The session did not report LockedHint=yes", attempts)
     if name in {"run_command", "bash"}:
-        return "VERIFIED", "Process exited with status 0", 1
+        return "COMMAND_COMPLETED", "Process exited with status 0; objective postcondition is not yet verified", 1
     if name in {"open_file", "browser_open", "browser_search", "send_notification",
                 "shutdown", "restart"}:
         return "DISPATCHED", "The desktop/system service accepted the request; final state is external to this process", 1
@@ -326,13 +416,17 @@ def _execute_once(name: str, args: dict) -> tuple[str, bool]:
             executable = shutil.which(app)
             return _launch([executable]) if executable else (f"Application not found: {app}", True)
         if name in {"close_app", "focus_window"}:
-            app = _token(args.get("app") or args.get("window_class"), "window class")
-            selector = f"class:^({re.escape(app)})$"
+            selector = _selector(args)
             action = "closewindow" if name == "close_app" else "focuswindow"
             return _run(["hyprctl", "dispatch", action, selector])
         if name == "move_window":
-            app = _token(args.get("window_class"), "window class")
-            selector = f"class:^({re.escape(app)})$"
+            selector = _selector(args)
+            if "workspace" in args:
+                workspace = _token(args.get("workspace"), "workspace")
+                return _run(["hyprctl", "dispatch", "movetoworkspacesilent",
+                             f"{workspace},{selector}"])
+            if "x" not in args or "y" not in args:
+                raise ValueError("move_window requires workspace or x and y")
             return _run(["hyprctl", "dispatch", "movewindowpixel", "exact",
                          str(int(args["x"])), str(int(args["y"])), selector])
         if name == "switch_workspace":
@@ -378,7 +472,9 @@ def _execute_once(name: str, args: dict) -> tuple[str, bool]:
                 raise ValueError("percent must be between 0 and 150")
             return _run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{percent}%"])
         if name == "play_pause":
-            return _run(["playerctl", "play-pause"])
+            player = str(args.get("player") or "").strip()
+            argv = ["playerctl"] + (["-p", _token(player, "player")] if player else [])
+            return _run([*argv, "play-pause"])
         if name == "set_brightness":
             percent = int(args["percent"])
             if not 1 <= percent <= 100:
@@ -400,7 +496,7 @@ def _execute_once(name: str, args: dict) -> tuple[str, bool]:
                 raise ValueError("commit message is required")
             return _run(["git", "commit", "-m", message], cwd=repo, timeout=120)
         if name == "launch_terminal":
-            cwd = _path(args.get("cwd"), must_exist=True)
+            cwd = _terminal_cwd(args)
             terminal = os.environ.get("TERMINAL", "kitty")
             executable = shutil.which(terminal)
             if not executable:
@@ -433,6 +529,9 @@ def _execute_once(name: str, args: dict) -> tuple[str, bool]:
                 return "The active window is not a recognized browser", True
             return json.dumps({"class": app_class, "title": window.get("title", ""),
                                "url": None, "note": "URL unavailable without browser integration"}), False
+        if name == "get_desktop_context":
+            return json.dumps(desktop_context.get_snapshot(
+                refresh=bool(args.get("refresh", False))), ensure_ascii=False), False
         if name == "lock_computer":
             return _run(["loginctl", "lock-session"])
         if name == "shutdown":

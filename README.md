@@ -18,6 +18,7 @@ front-ends share the same ideas:
 ```
 helper/      Python helpers driven by the QML shell over line-delimited JSON
   ai_helper.py     agentic chat loop (DeepSeek), tool dispatch, memory + profile
+  desktop_context.py normalized cached Hyprland/MPRIS/Git awareness
   vectordb.py      semantic memory — ChromaDB + on-device MiniLM embeddings
   user_profile.py  durable "about me" facts, injected into the prompt each turn
   knowledge.py     system-as-RAG (ripgrep over curated dirs)
@@ -33,7 +34,8 @@ mobile/            the Android app (self-contained Gradle project)
 ## Desktop quick start
 
 ```bash
-sudo pacman -S quickshell
+sudo pacman -S quickshell hyprland playerctl git ripgrep wl-clipboard \
+  wireplumber brightnessctl libnotify
 python3 -m venv venv && venv/bin/pip install -r helper/requirements.txt
 
 # API key: env var or config file (both gitignored)
@@ -69,9 +71,11 @@ brightness, notifications, Git, terminal/command execution, browser launch/searc
 session locking, and power controls. `run_command` accepts an argv array without shell
 parsing; `bash` is retained as an explicit power-user fallback.
 
-Tools run immediately without a separate per-action approval prompt. File and Git paths
-remain constrained to the user's home directory. `browser_current_page` can report the
-active browser window title, but not its URL without a browser integration.
+Read-only and safe actions run immediately. Reversible actions remain explicitly
+classified, while sensitive actions (`bash`, arbitrary commands, commits, deletion,
+lockdown and power controls) require exact confirmation. Permission and verification are
+separate: permission decides whether ATLAS may execute; verification determines whether
+the requested outcome happened. File and Git paths remain constrained to the user's home.
 
 Typed actions return a machine-readable verification envelope with `state`, `action`,
 `verification`, `attempts`, and command `output`. Observable actions verify their real
@@ -80,6 +84,41 @@ volume/brightness read-back, filesystem state, or changed Git HEAD). A failed ap
 gets one bounded executable fallback. Requests whose final state cannot be observed are
 reported as `DISPATCHED`, not success. The shared prompt requires the agent to use this
 evidence in an action → verify → retry or report-failure loop.
+
+Successful `run_command` and `bash` calls report `COMMAND_COMPLETED`; exit code zero alone
+does not verify the user's broader objective. The Verifier requires a later observation
+when the objective has a postcondition.
+
+### Desktop context (M3)
+
+`helper/desktop_context.py` maintains a short-lived local snapshot of the active window,
+workspace, monitor, normalized open windows, MPRIS media, and a confidently detected Git
+project. Hyprland's event socket invalidates the cache after window/workspace/monitor
+changes; explicit refreshes recover from missed events. Failed observations retain safe
+cached state marked `stale` and never invent project context.
+
+The model receives only a compact summary (active app/title, workspace/monitor, confident
+project/Git state, and active media). Full window lists remain local unless ATLAS calls the
+read-only `get_desktop_context` tool. Clipboard contents and raw event logs are never
+automatically injected.
+
+Context-aware window tools prefer exact Hyprland addresses. `close_app` can target the
+active window, `move_window` supports exact workspace moves, `launch_terminal` uses the
+confident current project when no directory is supplied, and `play_pause` can address the
+observed MPRIS player.
+
+For a minimal CI/development environment install `helper/requirements-dev.txt`. Optional
+runtime groups are documented by `requirements-memory.txt` and `requirements-voice.txt`;
+the aggregate `requirements.txt` installs the complete desktop application.
+
+Real-machine checks (not run in GitHub Actions):
+
+1. Focus an editor launched from a Git repository and ask “What am I working on?”
+2. Ask “Move this to workspace 3”, then confirm `hyprctl clients -j` reports workspace 3.
+3. Ask “Open a terminal here” and check its working directory is the detected project.
+4. Start MPRIS playback, ask “What is playing?”, then “Pause it” and check player status.
+5. Ask “What branch am I on?” and compare with `git branch --show-current`.
+6. Focus a non-project window and ask “Run the tests”; ATLAS should ask which project.
 
 ### Internal ATLAS architecture
 

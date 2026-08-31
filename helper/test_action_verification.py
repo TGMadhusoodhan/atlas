@@ -6,6 +6,18 @@ import ai_helper
 
 
 class ExistingActionVerificationTest(unittest.TestCase):
+    @patch("ai_helper.desktop_context.compact_prompt", return_value="# Current desktop context\nActive app: code")
+    @patch("ai_helper.ORCHESTRATOR.memory.recall", return_value=[])
+    @patch("ai_helper.knowledge.roots_summary", return_value="~/atlas")
+    @patch("ai_helper.user_profile.load_profile", return_value="")
+    def test_compact_desktop_context_is_automatically_injected(
+            self, profile, roots, recall, compact):
+        messages = ai_helper._inject_context([
+            {"role": "user", "content": "What am I working on?"},
+        ])
+        self.assertIn("# Current desktop context", messages[0]["content"])
+        self.assertIn("Active app: code", messages[0]["content"])
+
     @patch("ai_helper._lockdown_call")
     def test_lockdown_start_reads_back_active_target(self, call):
         call.side_effect = [

@@ -36,6 +36,7 @@ import knowledge
 import lockdown_client
 import metrics
 import research_helper
+import desktop_context
 from capabilities import system_prompt
 from desktop_tools import (
     DESKTOP_TOOLS, DESKTOP_TOOL_NAMES, execute as execute_desktop_tool,
@@ -44,7 +45,7 @@ from desktop_tools import (
 from conversation_store import ConversationStore
 from cloud_preview import CloudPreviewBroker
 from orchestrator import AtlasOrchestrator, Verifier
-from tool_policy import ApprovalBroker, is_mutating, parse_tool_arguments
+from tool_policy import ApprovalBroker, is_mutating, parse_tool_arguments, requires_approval
 import user_profile
 import vectordb
 
@@ -526,6 +527,7 @@ def _inject_context(api_messages: list) -> list:
         parts.append("\n## What you already know about the user\n" + profile)
 
     parts.append(ORCHESTRATOR.prompt_context(route, plan))
+    parts.append("\n\n" + desktop_context.compact_prompt())
 
     preamble = "\n".join(parts)
 
@@ -589,7 +591,7 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
         "",
     )
     route, plan = ORCHESTRATOR.prepare(objective)
-    verifier = Verifier(route)
+    verifier = Verifier(route, objective)
     defer_output = route.needs_action or (route.needs_research and not route.needs_web_research)
     emit({"type": "orchestration", "id": req_id, **ORCHESTRATOR.event(route, plan)})
     emit({"type": "status", "id": req_id, "state": "thinking", "model": model})
@@ -754,9 +756,26 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                 except ValueError as error:
                     output, is_error = str(error), True
                 else:
-                    output, is_error = await loop.run_in_executor(
-                        None, execute_tool, tc_name, tc_args
-                    )
+                    if requires_approval(tc_name, tc_args):
+                        approved = await approvals.request(
+                            req_id, tc["id"], tc_name, tc_args,
+                            on_pending=lambda: emit({
+                                "type": "tool_approval_required", "id": req_id,
+                                "call_id": tc["id"], "name": tc_name,
+                                "arguments": tc_args, "inputText": input_text,
+                                "expires_in_seconds": approvals.timeout_seconds,
+                            }),
+                        )
+                        if not approved:
+                            output, is_error = "Sensitive action rejected or approval expired", True
+                        else:
+                            output, is_error = await loop.run_in_executor(
+                                None, execute_tool, tc_name, tc_args
+                            )
+                    else:
+                        output, is_error = await loop.run_in_executor(
+                            None, execute_tool, tc_name, tc_args
+                        )
 
                 result_state = _result_state(tc_name, output, is_error)
                 verifier.record(name=tc_name, state=result_state, mutating=mutation)
@@ -822,6 +841,7 @@ async def main() -> None:
     # Warm the semantic-memory embedder in the background so the first chat's
     # auto-recall doesn't block while the model loads.
     threading.Thread(target=lambda: vectordb.search("warmup"), daemon=True).start()
+    desktop_context.STORE.start_event_listener()
 
     def _reader_thread() -> None:
         buf = b""

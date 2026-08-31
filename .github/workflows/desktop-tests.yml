@@ -1,0 +1,30 @@
+name: Desktop tests
+
+on:
+  push:
+    paths-ignore:
+      - "mobile/**"
+  pull_request:
+    paths-ignore:
+      - "mobile/**"
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: helper/requirements-dev.txt
+      - name: Install desktop test dependencies
+        run: python -m pip install -r helper/requirements-dev.txt
+      - name: Ruff
+        run: ruff check helper voice lockdown
+      - name: Helper tests
+        run: python -m unittest discover -s helper -p 'test_*.py'
+      - name: Voice tests
+        run: python -m unittest discover -s voice -p 'test_*.py'
+      - name: Lockdown tests
+        run: python -m unittest discover -s lockdown -p 'test_*.py'

@@ -76,6 +76,22 @@ class VerifierTests(unittest.TestCase):
         verifier.record(name="knowledge_search", state="COMPLETED", mutating=False)
         self.assertTrue(verifier.assess().terminal)
 
+    def test_command_exit_zero_requires_follow_up_observation(self):
+        objective = "Fix the issue and run the tests"
+        verifier = Verifier(IntentRouter().route(objective), objective)
+        verifier.record(name="run_command", state="COMMAND_COMPLETED", mutating=True)
+        self.assertFalse(verifier.assess().terminal)
+        verifier.record(name="git_status", state="VERIFIED", mutating=False)
+        self.assertTrue(verifier.assess().terminal)
+
+    def test_plain_run_request_reports_command_completed_without_claiming_verified(self):
+        objective = "Run the tests"
+        verifier = Verifier(IntentRouter().route(objective), objective)
+        verifier.record(name="run_command", state="COMMAND_COMPLETED", mutating=True)
+        assessment = verifier.assess()
+        self.assertTrue(assessment.terminal)
+        self.assertEqual(assessment.outcome, "COMMAND_COMPLETED")
+
 
 if __name__ == "__main__":
     unittest.main()
