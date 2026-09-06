@@ -1,10 +1,15 @@
 package com.madhu.atlas.voice
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import com.madhu.atlas.AtlasApp
@@ -51,6 +56,10 @@ class VoiceService : Service() {
 
     /** Cleared in [onDestroy] so a tear-down never re-arms the mic (fixes stop-button). */
     @Volatile private var alive = true
+
+    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+    private var focusRequest: AudioFocusRequest? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -112,21 +121,22 @@ class VoiceService : Service() {
         if (!alive) return                       // service is being torn down — don't re-arm
         val engine = stt ?: return
         setPhase(VoicePhase.WAKE, "Say “Hey Atlas”")
-        engine.start(
-            grammar = VoskStt.WAKE_GRAMMAR,
-            onPartial = { if (matchesWake(it)) onWake() },
-            onResult = { if (matchesWake(it)) onWake() },
+        engine.startWake(
+            onWake = { text, confidence -> if (isWake(text, confidence)) onWake() },
             onError = { fail(it) },
         )
     }
 
     /**
-     * The wake grammar already restricts the vocabulary, so a lenient match on "atlas"
-     * reliably catches "hey atlas" without demanding a perfect transcription from the
-     * tiny model. The wake word is the "I'm talking to you" signal — one wake opens a
-     * whole conversation (see [runTurn]).
+     * Accept a wake only on a **final** result that has both words of "hey atlas" and clears
+     * a confidence floor — this rejects stray "atlas" hits and music-forced matches (the
+     * false positives), at the cost of needing a reasonably clear phrase. [WAKE_MIN_CONFIDENCE]
+     * is the tuning knob: lower = more sensitive (also more false triggers).
      */
-    private fun matchesWake(text: String): Boolean = text.contains("atlas", ignoreCase = true)
+    private fun isWake(text: String, confidence: Double): Boolean {
+        val t = text.trim().lowercase()
+        return t.contains("atlas") && t.contains("hey") && confidence >= WAKE_MIN_CONFIDENCE
+    }
 
     /** Called from Vosk's thread; guard against duplicate triggers, then run one turn. */
     private fun onWake() {
@@ -136,23 +146,62 @@ class VoiceService : Service() {
     }
 
     /**
-     * One wake opens a whole conversation: keep listening and serving, answering each
-     * thing said with no need to repeat "Hey Atlas". A short stretch of silence ends the
-     * session and returns to the wake word. "Always There, Listening And Serving."
+     * A wake ("Hey Atlas") starts a conversation. It answers your command, then keeps the
+     * follow-up loop open **only while it's actually conversing with you** — i.e. when its
+     * reply is a question expecting an answer. A plain command ("set an alarm") gets a
+     * terminal reply, so it goes straight back to sleep instead of lingering. Silence also
+     * ends it. You say "Hey Atlas" again to start a new conversation.
      */
     private suspend fun runTurn() {
         try {
+            beginSession()                       // pause music (accuracy) + keep CPU awake if locked
             stt?.stop()                          // stop the wake listener, free the mic
-            while (alive) {
-                setPhase(VoicePhase.LISTENING, "Listening…")
+            var followUp = false
+            do {
+                setPhase(VoicePhase.LISTENING, if (followUp) "Listening… (follow-up)" else "Listening…")
                 val text = capture()
-                if (text.isBlank()) break        // silence → end the session
-                respond(text)
-            }
+                if (text.isBlank()) break        // silence → end the conversation
+                val answer = respond(text)
+                followUp = answer.trimEnd().endsWith("?")   // keep going only if ATLAS asked
+            } while (followUp && alive)
         } finally {
+            endSession()
             busy = false
             listenForWake()                      // back to sleep / wake word (no-op if !alive)
         }
+    }
+
+    /**
+     * Take transient audio focus (pauses/ducks other players so the mic hears you and TTS
+     * is clear — fixes erratic recognition while music plays) and hold a short CPU wakelock
+     * so a turn still completes with the screen off.
+     */
+    private fun beginSession() {
+        runCatching {
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .build()
+            focusRequest = req
+            audioManager.requestAudioFocus(req)
+        }
+        runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "atlas:voiceTurn").also {
+                it.acquire(60_000L)              // safety-capped; released in endSession
+            }
+        }
+    }
+
+    private fun endSession() {
+        focusRequest?.let { runCatching { audioManager.abandonAudioFocusRequest(it) } }
+        focusRequest = null
+        wakeLock?.let { if (it.isHeld) runCatching { it.release() } }
+        wakeLock = null
     }
 
     /**
@@ -201,12 +250,13 @@ class VoiceService : Service() {
         return text.trim()
     }
 
-    /** Think + speak one directed utterance. */
-    private suspend fun respond(text: String) {
+    /** Think + speak one directed utterance; returns the spoken answer. */
+    private suspend fun respond(text: String): String {
         setPhase(VoicePhase.THINKING, text)
         val answer = think(text)
         setPhase(VoicePhase.SPEAKING, answer)
         tts?.speak(answer.ifBlank { "Sorry, I didn't catch that." })
+        return answer
     }
 
     /** Run the shared agent loop for one spoken command and return the spoken reply. */
@@ -258,6 +308,7 @@ class VoiceService : Service() {
         private const val NOTIF_ID = 42
         private const val NO_SPEECH_TIMEOUT_MS = 8_000L   // silence before it sleeps
         private const val MAX_UTTERANCE_MS = 15_000L      // hard cap on one spoken turn
+        private const val WAKE_MIN_CONFIDENCE = 0.80      // reject low-confidence wake matches
         private const val MAX_HISTORY = 8
         private const val VOSK_ASSET_DIR = "vosk-model"
     }

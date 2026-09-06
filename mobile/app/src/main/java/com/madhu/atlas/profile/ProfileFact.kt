@@ -10,6 +10,8 @@ data class ProfileFact(
     val category: String = "Other",
     val fact: String = "",
     val createdAt: Long = System.currentTimeMillis(),
+    val sourceTurnId: String? = null,
+    val userConfirmed: Boolean = true,
 )
 
 /** The fixed set of categories, matching the desktop profile sections. */

@@ -1,54 +1,26 @@
 package com.madhu.atlas
 
-import android.Manifest
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.os.Build
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
-import androidx.core.content.ContextCompat
+import android.widget.Toast
 import androidx.lifecycle.lifecycleScope
+import com.madhu.atlas.tools.SpotifyController
 import com.madhu.atlas.ui.ChatScreen
 import com.madhu.atlas.ui.theme.AtlasTheme
-import com.madhu.atlas.voice.VoiceService
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
-    private val requestPermissions =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            maybeStartAlwaysListening()
-        }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-
-        // Ask once for the permissions the assistant needs: notifications (reminders),
-        // mic (wake word), contacts (call by name). CALL_PHONE stays optional — call_number
-        // falls back to the dialer without it.
-        val wanted = buildList {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-                add(Manifest.permission.POST_NOTIFICATIONS)
-            add(Manifest.permission.RECORD_AUDIO)
-            add(Manifest.permission.READ_CONTACTS)
-            // Calling + in-call control (place, answer, reject, reject-with-message).
-            add(Manifest.permission.CALL_PHONE)
-            add(Manifest.permission.ANSWER_PHONE_CALLS)
-            add(Manifest.permission.READ_PHONE_STATE)
-            add(Manifest.permission.READ_CALL_LOG)
-            add(Manifest.permission.SEND_SMS)
-        }.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-        if (wanted.isNotEmpty()) requestPermissions.launch(wanted.toTypedArray())
-        else maybeStartAlwaysListening()
 
         setContent {
             AtlasTheme {
@@ -57,22 +29,44 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        handleSpotifyCallback(intent)
     }
 
-    /** Start the background wake service if the user wants it and the mic is granted. */
-    private fun maybeStartAlwaysListening() {
-        val micOk = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
-        if (!micOk) return
-        val settings = (application as AtlasApp).container.settings
+    /** Launch the Spotify account login so ATLAS can reach the user's liked songs/playlists. */
+    fun connectSpotify() {
+        if (BuildConfig.SPOTIFY_CLIENT_ID.isBlank()) {
+            Toast.makeText(this, "Spotify not configured in this build.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val secrets = (application as AtlasApp).container.secrets
+        val request = SpotifyController.authorizationRequest()
+        secrets.spotifyPkceVerifier = request.verifier
+        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(request.url)))
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleSpotifyCallback(intent)
+    }
+
+    private fun handleSpotifyCallback(intent: Intent?) {
+        val uri = intent?.data ?: return
+        if (uri.scheme != "com.madhu.atlas" || uri.host != "callback") return
+        val error = uri.getQueryParameter("error")
+        val code = uri.getQueryParameter("code")
+        val secrets = (application as AtlasApp).container.secrets
+        val verifier = secrets.spotifyPkceVerifier
+        secrets.spotifyPkceVerifier = null
+        if (error != null || code == null || verifier == null) {
+            Toast.makeText(this, "Spotify login was not completed.", Toast.LENGTH_SHORT).show()
+            return
+        }
         lifecycleScope.launch {
-            if (settings.alwaysListeningNow()) {
-                runCatching {
-                    ContextCompat.startForegroundService(
-                        this@MainActivity, Intent(this@MainActivity, VoiceService::class.java)
-                    )
-                }
-            }
+            val ok = SpotifyController.exchangeCode(code, verifier, secrets)
+            Toast.makeText(this@MainActivity,
+                if (ok) "Spotify connected." else "Spotify connection failed.", Toast.LENGTH_SHORT).show()
         }
     }
+
 }

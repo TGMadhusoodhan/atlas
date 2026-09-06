@@ -45,10 +45,17 @@ export DEEPSEEK_API_KEY="sk-..."
 qs -p .            # sidebar starts hidden; bind a key to toggle it
 ```
 
-Hyprland keybind:
+Hyprland development launch and keybinds for this working tree:
 ```
-bind = SUPER, A, exec, qs ipc -p ~/atlas call ai-sidebar toggle
+exec-once = qs -p /home/MadhuArch/atlas
+bind = SUPER, A, exec, qs ipc -p /home/MadhuArch/atlas call ai-sidebar toggle
+bind = SUPER, SPACE, exec, qs ipc -p /home/MadhuArch/atlas call voice ptt
+bind = SUPER SHIFT, SPACE, exec, qs ipc -p /home/MadhuArch/atlas call voice stop
 ```
+
+The `-p` path identifies the running Quickshell instance. Do not point these
+development bindings at the former `/home/MadhuArch/ai-sidebar` tree while the
+Atlas instance is active. Reload Hyprland after updating the local configuration.
 
 Semantic memory + profile live under `~/.local/share/ai-sidebar/` (outside the repo).
 

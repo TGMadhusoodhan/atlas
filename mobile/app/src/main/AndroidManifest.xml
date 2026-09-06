@@ -10,21 +10,6 @@
 
     <!-- Voice (M3): "Hey Atlas" wake word + speech recognition. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <!-- Always-on: keep the wake service running and restart it after reboot. -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-
-    <!-- Calling: read contacts to resolve "call Mom" → number; CALL_PHONE to place the
-         call (optional — call_number falls back to the dialer if it isn't granted). -->
-    <uses-permission android:name="android.permission.READ_CONTACTS" />
-    <uses-permission android:name="android.permission.CALL_PHONE" />
-
-    <!-- In-call control: answer / reject / hang up, and reject-with-message. -->
-    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
-    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
-    <uses-permission android:name="android.permission.READ_CALL_LOG" />
-    <uses-permission android:name="android.permission.SEND_SMS" />
 
     <!-- Package visibility (Android 11+): lets open_app enumerate launchable apps and
          lets the tools resolve dialer / mail / browser / camera handlers. -->
@@ -74,31 +59,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="com.madhu.atlas" android:host="callback" />
+            </intent-filter>
         </activity>
 
-        <!-- Always-listening "Hey Atlas" pipeline. Microphone foreground service so
-             it can keep the wake word running with the app backgrounded. -->
-        <service
-            android:name=".voice.VoiceService"
-            android:exported="false"
-            android:foregroundServiceType="microphone" />
-
-        <!-- Restart the wake service after reboot (best-effort; see BootReceiver). -->
-        <receiver
-            android:name=".voice.BootReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
-
-        <!-- Track the ringing caller's number for reject-with-message. -->
-        <receiver
-            android:name=".tools.PhoneStateReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.PHONE_STATE" />
-            </intent-filter>
-        </receiver>
     </application>
 </manifest>

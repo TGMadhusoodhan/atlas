@@ -5,7 +5,6 @@ import com.madhu.atlas.llm.LlmChunk
 import com.madhu.atlas.llm.LlmMessage
 import com.madhu.atlas.llm.RawToolCall
 import com.madhu.atlas.llm.Role
-import com.madhu.atlas.memory.MemoryStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.json.Json
@@ -23,8 +22,7 @@ sealed interface AgentEvent {
 
 /**
  * The reused core (port of `ai_helper.py`'s agent_loop): build the prompt, pick an
- * engine, stream the reply, run any requested tools, and loop until the model answers.
- * After a successful turn it stores the exchange in semantic memory.
+ * engine, stream the reply, and allow at most one tool-result continuation.
  *
  * In M1 the [ToolRegistry] is empty, so this is a single streaming pass + memory write.
  * The tool machinery is present so M2 slots in without changing the loop.
@@ -33,21 +31,28 @@ class AgentLoop(
     private val router: EngineRouter,
     private val systemPrompt: SystemPrompt,
     private val tools: ToolRegistry,
-    private val memory: MemoryStore,
 ) {
-    fun run(history: List<LlmMessage>): Flow<AgentEvent> = flow {
-        val latestUser = history.lastOrNull { it.role == Role.USER }?.content.orEmpty()
+    data class CloudDisclosure(
+        val messages: List<LlmMessage>,
+        val tools: List<ToolSpec>,
+    )
 
-        val convo = ArrayList<LlmMessage>()
-        convo.add(LlmMessage(Role.SYSTEM, systemPrompt.build(latestUser)))
-        convo.addAll(history)
+    suspend fun cloudDisclosure(history: List<LlmMessage>): CloudDisclosure {
+        val latestUser = history.lastOrNull { it.role == Role.USER }?.content.orEmpty()
+        return CloudDisclosure(
+            messages = listOf(LlmMessage(Role.SYSTEM, systemPrompt.build(latestUser))) + history,
+            tools = tools.specs(),
+        )
+    }
+
+    fun run(history: List<LlmMessage>): Flow<AgentEvent> = flow {
+        val disclosure = cloudDisclosure(history)
+        val convo = ArrayList(disclosure.messages)
 
         val engine = router.pick()
         emit(AgentEvent.EngineSelected(engine.id))
 
-        val toolSpecs = tools.specs()
-        val finalAnswer = StringBuilder()
-
+        val toolSpecs = disclosure.tools
         var step = 0
         while (step < MAX_STEPS) {
             step++
@@ -93,16 +98,11 @@ class AgentLoop(
                 continue  // let the model use the tool results
             }
 
-            finalAnswer.append(stepText)
             break
         }
 
         emit(AgentEvent.Done)
 
-        val answer = finalAnswer.toString().trim()
-        if (answer.isNotEmpty() && latestUser.isNotEmpty()) {
-            runCatching { memory.add("USER: $latestUser\nATLAS: $answer", source = "chat") }
-        }
     }
 
     private fun parseArgs(argumentsJson: String): JsonObject =
@@ -110,7 +110,7 @@ class AgentLoop(
             .getOrElse { JsonObject(emptyMap()) }
 
     private companion object {
-        const val MAX_STEPS = 6
+        const val MAX_STEPS = 2
         val json = Json { ignoreUnknownKeys = true; isLenient = true }
     }
 }

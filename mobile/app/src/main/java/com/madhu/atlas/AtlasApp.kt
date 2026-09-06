@@ -2,23 +2,23 @@ package com.madhu.atlas
 
 import android.app.Application
 import android.content.Context
-import android.util.Log
 import com.madhu.atlas.agent.AgentLoop
 import com.madhu.atlas.agent.SystemPrompt
 import com.madhu.atlas.agent.ToolRegistry
+import com.madhu.atlas.actions.ActionExecutor
+import com.madhu.atlas.actions.ConsentBroker
+import com.madhu.atlas.actions.DeterministicCommandParser
+import com.madhu.atlas.chat.ConversationRepository
 import com.madhu.atlas.data.Connectivity
 import com.madhu.atlas.data.Secrets
 import com.madhu.atlas.data.SettingsStore
 import com.madhu.atlas.llm.DeepSeekEngine
-import com.madhu.atlas.llm.EchoEngine
+import com.madhu.atlas.llm.UnavailableEngine
 import com.madhu.atlas.llm.EngineRouter
 import com.madhu.atlas.llm.LlmEngine
-import com.madhu.atlas.memory.Embedder
-import com.madhu.atlas.memory.MemoryStore
 import com.madhu.atlas.profile.AtlasDatabase
 import com.madhu.atlas.profile.ProfileStore
 import com.madhu.atlas.tools.Notifications
-import com.madhu.atlas.tools.deviceTools
 import com.madhu.atlas.tools.profileTools
 
 class AtlasApp : Application() {
@@ -45,28 +45,24 @@ class AtlasContainer(context: Context) {
     private val connectivity = Connectivity(appContext)
 
     private val db = AtlasDatabase.get(appContext)
-
-    // Semantic memory. Embedder needs the MiniLM assets; if absent, memory runs
-    // disabled (embedder = null) and chat is unaffected — same fail-soft as desktop.
-    private val embedder: Embedder? = runCatching { Embedder.create(appContext) }
-        .onFailure { Log.w("ATLAS", "Embedder unavailable — memory disabled: ${it.message}") }
-        .getOrNull()
-    val memory = MemoryStore.create(db.memoryDao(), embedder)
+    val conversations = ConversationRepository(db.conversationDao())
+    val commandParser = DeterministicCommandParser()
+    val consentBroker = ConsentBroker(db.actionDao(), ActionExecutor(appContext))
 
     // Long-term profile facts.
     private val profile = ProfileStore(db.profileDao())
 
-    // Engines: Echo is the offline placeholder until GenieEngine (NPU) is wired in M1 step 5.
-    private val local: LlmEngine = EchoEngine()
+    // One real conversation engine. Offline mode fails explicitly instead of simulating an answer.
+    private val local: LlmEngine = UnavailableEngine()
     private val online: LlmEngine = DeepSeekEngine(apiKeyProvider = { secrets.deepSeekApiKey })
     private val router = EngineRouter(local, online, connectivity, settings)
 
-    // The reused agent core, now with the M2 device toolset.
-    private val systemPrompt = SystemPrompt(profile, memory)
+    // Device actions are deliberately excluded: only the deterministic command parser
+    // may propose them through the consent broker. The LLM retains explicit fact tools.
+    private val systemPrompt = SystemPrompt(profile)
     val agentLoop = AgentLoop(
         router,
         systemPrompt,
-        ToolRegistry(deviceTools(appContext) + profileTools(profile)),
-        memory,
+        ToolRegistry(profileTools(profile)),
     )
 }

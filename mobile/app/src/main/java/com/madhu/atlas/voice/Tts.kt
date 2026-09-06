@@ -41,15 +41,28 @@ class Tts(context: Context) {
     }
 
     suspend fun speak(text: String) {
-        if (text.isBlank() || !ready.await()) return
+        val spoken = clean(text)
+        if (spoken.isBlank() || !ready.await()) return
         suspendCancellableCoroutine { c ->
             cont = c
             val id = System.nanoTime().toString()
-            val res = engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
+            val res = engine.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, id)
             if (res != TextToSpeech.SUCCESS) resumeOnce()
             c.invokeOnCancellation { engine.stop() }
         }
     }
+
+    /**
+     * Make text speakable: drop emoji/pictographs (which the TTS otherwise reads aloud as
+     * "grinning face" etc.) and light markdown, then tidy whitespace. Only affects speech —
+     * the chat UI still shows the original text.
+     */
+    private fun clean(text: String): String =
+        text
+            .replace(EMOJI, " ")
+            .replace(MARKDOWN, "")
+            .replace(WHITESPACE, " ")
+            .trim()
 
     fun stop() {
         if (::engine.isInitialized) engine.stop()
@@ -62,5 +75,20 @@ class Tts(context: Context) {
     private fun resumeOnce() {
         cont?.let { if (it.isActive) it.resume(Unit) }
         cont = null
+    }
+
+    private companion object {
+        // Emoji/pictographs (supplementary-plane via surrogates) + misc symbols, dingbats,
+        // and variation selectors that the TTS would otherwise pronounce.
+        val EMOJI = Regex(
+            "[\\uD800-\\uDBFF][\\uDC00-\\uDFFF]" +   // surrogate pairs (most emoji)
+                "|[\\u2600-\\u27BF]" +               // misc symbols + dingbats
+                "|[\\u2190-\\u21FF]" +               // arrows
+                "|[\\u2B00-\\u2BFF]" +               // misc symbols and arrows
+                "|[\\uFE00-\\uFE0F]" +               // variation selectors
+                "|[\\u2122\\u2139\\u203C\\u2049]"    // ™ ℹ ‼ ⁉
+        )
+        val MARKDOWN = Regex("[*_`#>]+")
+        val WHITESPACE = Regex("\\s+")
     }
 }

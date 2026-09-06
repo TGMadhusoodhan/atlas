@@ -29,6 +29,16 @@ class Secrets(context: Context) {
         get() = decrypt(prefs.getString(KEY_DEEPSEEK, null))?.takeIf { it.isNotBlank() }
         set(value) = put(KEY_DEEPSEEK, value)
 
+    /** Spotify OAuth refresh token — lets it act on the user's library (liked/playlists). */
+    var spotifyRefreshToken: String?
+        get() = decrypt(prefs.getString(KEY_SPOTIFY_REFRESH, null))?.takeIf { it.isNotBlank() }
+        set(value) = put(KEY_SPOTIFY_REFRESH, value)
+
+    /** Short-lived OAuth PKCE verifier, persisted so an authorization callback survives process death. */
+    var spotifyPkceVerifier: String?
+        get() = decrypt(prefs.getString(KEY_SPOTIFY_PKCE, null))?.takeIf { it.isNotBlank() }
+        set(value) = put(KEY_SPOTIFY_PKCE, value)
+
     private fun put(key: String, value: String?) {
         prefs.edit().apply {
             if (value.isNullOrBlank()) remove(key) else putString(key, encrypt(value.trim()))
@@ -82,6 +92,8 @@ class Secrets(context: Context) {
 
     private companion object {
         const val KEY_DEEPSEEK = "deepseek_api_key"
+        const val KEY_SPOTIFY_REFRESH = "spotify_refresh_token"
+        const val KEY_SPOTIFY_PKCE = "spotify_pkce_verifier"
         const val KEYSTORE = "AndroidKeyStore"
         const val ALIAS = "atlas_secret_key"
         const val TRANSFORM = "AES/GCM/NoPadding"

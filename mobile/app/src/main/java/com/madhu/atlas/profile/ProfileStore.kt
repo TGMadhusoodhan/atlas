@@ -34,7 +34,7 @@ class ProfileStore(private val dao: ProfileDao) {
 
     /** Markdown block injected into the system prompt, or "" if nothing learned yet. */
     suspend fun renderForPrompt(): String {
-        val facts = dao.all()
+        val facts = dao.all().filter { it.userConfirmed }
         if (facts.isEmpty()) return ""
         val sb = StringBuilder("What I know about you:\n")
         ProfileCategories.ALL.forEach { cat ->

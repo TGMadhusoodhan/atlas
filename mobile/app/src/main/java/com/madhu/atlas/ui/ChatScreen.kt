@@ -13,6 +13,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -52,33 +55,26 @@ import androidx.compose.material.icons.filled.MicNone
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.madhu.atlas.MainActivity
 import com.madhu.atlas.chat.ChatMessage
 import com.madhu.atlas.chat.Sender
-import com.madhu.atlas.voice.VoicePhase
-import com.madhu.atlas.voice.VoiceStatus
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val voicePhase by VoiceStatus.phase.collectAsStateWithLifecycle()
-    val voiceDetail by VoiceStatus.detail.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     var showSettings by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
     val micPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted -> if (granted) viewModel.startVoice() }
+    ) { granted -> if (granted) viewModel.listenOnce() }
 
-    fun toggleVoice() {
-        if (voicePhase == VoicePhase.OFF) {
-            val granted = ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) ==
-                android.content.pm.PackageManager.PERMISSION_GRANTED
-            if (granted) viewModel.startVoice() else micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
-        } else {
-            viewModel.stopVoice()
-        }
+    fun startPushToTalk() {
+        val granted = ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) viewModel.listenOnce() else micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
     }
 
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text) {
@@ -89,11 +85,21 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
         SettingsDialog(
             onlineEnabled = state.onlineEnabled,
             hasApiKey = state.hasApiKey,
-            alwaysListening = state.alwaysListening,
             onToggleOnline = viewModel::setOnline,
-            onToggleAlwaysListening = viewModel::setAlwaysListening,
             onSaveKey = viewModel::saveApiKey,
+            onConnectSpotify = { (context as? MainActivity)?.connectSpotify() },
+            cloudDisclosure = state.cloudDisclosure,
             onDismiss = { showSettings = false },
+        )
+    }
+
+    state.pendingAction?.let { action ->
+        AlertDialog(
+            onDismissRequest = viewModel::cancelPendingAction,
+            title = { Text("Confirm action") },
+            text = { Text(action.label) },
+            confirmButton = { TextButton(onClick = viewModel::confirmPendingAction) { Text("Continue") } },
+            dismissButton = { TextButton(onClick = viewModel::cancelPendingAction) { Text("Cancel") } },
         )
     }
 
@@ -108,8 +114,8 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
                     Column {
                         Text("ATLAS", fontWeight = FontWeight.Bold)
                         val sub = when {
-                            voicePhase != VoicePhase.OFF ->
-                                "🎙 ${voicePhase.name.lowercase()}" + if (voiceDetail.isNotBlank()) " · $voiceDetail" else ""
+                            state.listening -> "listening"
+                            state.pendingAction != null -> "awaiting confirmation"
                             state.generating && state.engine != null -> "thinking · ${state.engine}"
                             state.engine != null -> "ready · ${state.engine}"
                             else -> "Always There, Listening And Serving"
@@ -118,15 +124,17 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
                     }
                 },
                 actions = {
-                    val voiceOn = voicePhase != VoicePhase.OFF
-                    IconButton(onClick = { toggleVoice() }) {
+                    IconButton(onClick = { startPushToTalk() }, enabled = !state.listening) {
                         Icon(
-                            if (voiceOn) Icons.Filled.Mic else Icons.Filled.MicNone,
-                            contentDescription = if (voiceOn) "Stop voice" else "Start \"Hey Atlas\"",
-                            tint = if (voiceOn) MaterialTheme.colorScheme.primary else Color.Unspecified,
+                            if (state.listening) Icons.Filled.Mic else Icons.Filled.MicNone,
+                            contentDescription = "Push to talk",
+                            tint = if (state.listening) MaterialTheme.colorScheme.primary else Color.Unspecified,
                         )
                     }
-                    IconButton(onClick = { showSettings = true }) {
+                    IconButton(onClick = {
+                        viewModel.refreshCloudDisclosure()
+                        showSettings = true
+                    }) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }
                 },
@@ -217,10 +225,10 @@ private fun InputBar(
 private fun SettingsDialog(
     onlineEnabled: Boolean,
     hasApiKey: Boolean,
-    alwaysListening: Boolean,
     onToggleOnline: (Boolean) -> Unit,
-    onToggleAlwaysListening: (Boolean) -> Unit,
     onSaveKey: (String) -> Unit,
+    onConnectSpotify: () -> Unit,
+    cloudDisclosure: String,
     onDismiss: () -> Unit,
 ) {
     var key by remember { mutableStateOf("") }
@@ -233,15 +241,6 @@ private fun SettingsDialog(
                     Text("Use DeepSeek when online", modifier = Modifier.weight(1f))
                     Switch(checked = onlineEnabled, onCheckedChange = onToggleOnline)
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Always listening (background)", modifier = Modifier.weight(1f))
-                    Switch(checked = alwaysListening, onCheckedChange = onToggleAlwaysListening)
-                }
-                Text(
-                    "Keeps “Hey Atlas” running in the background (persistent notification, " +
-                        "uses more battery).",
-                    style = MaterialTheme.typography.labelSmall,
-                )
                 Text(
                     if (hasApiKey) "DeepSeek API key: saved" else "DeepSeek API key: not set",
                     style = MaterialTheme.typography.labelMedium,
@@ -255,10 +254,32 @@ private fun SettingsDialog(
                     singleLine = true,
                 )
                 Text(
-                    "Off / no key / offline → ATLAS answers fully on-device. " +
-                        "Voice (“Hey Atlas”) just needs the Vosk model asset — see VOICE_SETUP.",
+                    "Exact content included in the next cloud request:",
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier.padding(top = 8.dp),
+                )
+                Text(
+                    cloudDisclosure,
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 220.dp)
+                        .verticalScroll(rememberScrollState())
+                        .padding(top = 4.dp),
+                )
+                Text(
+                    "The API key is sent only in the authorization header. Voice starts only " +
+                        "when you tap the microphone.",
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                TextButton(
+                    onClick = onConnectSpotify,
+                    modifier = Modifier.padding(top = 8.dp),
+                ) { Text("Connect Spotify account") }
+                Text(
+                    "Needed to play from your Liked Songs and playlists.",
+                    style = MaterialTheme.typography.labelSmall,
                 )
             }
         },

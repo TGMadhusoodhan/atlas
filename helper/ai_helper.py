@@ -63,6 +63,21 @@ DEEPSEEK_BASE = "https://api.deepseek.com"
 MAX_TOOL_ITERATIONS = 8
 OUTPUT_TRUNCATE = 8000
 
+
+def voice_may_authorize_sensitive(transcript_assessment: str) -> bool:
+    return transcript_assessment != "UNCERTAIN"
+
+
+def _assistant_history_message(content: str, reasoning_content: str,
+                               tool_calls: list[dict] | None = None) -> dict:
+    """Preserve DeepSeek thinking history exactly across tool-enabled requests."""
+    message = {"role": "assistant", "content": content or ""}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    return message
+
 TOOLS = [
     {
         "type": "function",
@@ -547,9 +562,10 @@ def _build_cloud_body(messages: list, model: str, thinking: bool) -> dict:
         "messages": messages,
         "stream": True,
         "tools": TOOLS,
-        "tool_choice": "auto",
         "stream_options": {"include_usage": True},
     }
+    if not thinking:
+        body["tool_choice"] = "auto"
     if thinking:
         body["thinking"] = {"type": "enabled", "budget_tokens": 8192}
     return body
@@ -574,7 +590,10 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
         )
         return
 
+    transcript_assessment = "ACCEPT"
     if prepared_body:
+        prepared_body = copy.deepcopy(prepared_body)
+        transcript_assessment = prepared_body.pop("_atlas_transcript_assessment", "ACCEPT")
         model = prepared_body["model"]
         thinking = "thinking" in prepared_body
 
@@ -606,6 +625,7 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                 _build_cloud_body(api_messages, model, thinking)
 
             text_content = ""
+            reasoning_content = ""
             tool_calls_raw: dict[int, dict] = {}
             finish_reason = None
             first_text = True
@@ -647,6 +667,7 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
 
                             reasoning = delta.get("reasoning_content") or ""
                             if reasoning:
+                                reasoning_content += reasoning
                                 emit({"type": "thinking_token", "id": req_id, "text": reasoning})
 
                             content = delta.get("content") or ""
@@ -690,14 +711,16 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                       "outcome": assessment.outcome, "terminal": assessment.terminal,
                       "detail": assessment.feedback})
                 if not assessment.terminal and _iter + 1 < MAX_TOOL_ITERATIONS:
-                    api_messages.append({"role": "assistant", "content": text_content})
+                    api_messages.append(_assistant_history_message(
+                        text_content, reasoning_content))
                     api_messages.append({
                         "role": "system",
                         "content": "Verifier feedback: " + assessment.feedback,
                     })
                     emit({"type": "status", "id": req_id, "state": "thinking", "model": model})
                     continue
-                api_messages.append({"role": "assistant", "content": text_content})
+                api_messages.append(_assistant_history_message(
+                    text_content, reasoning_content))
                 if defer_output and text_content:
                     emit({"type": "status", "id": req_id, "state": "streaming"})
                     emit({"type": "token", "id": req_id, "text": text_content})
@@ -720,11 +743,8 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                 for i in sorted(tool_calls_raw)
             ]
             tool_call_count += len(tc_list)
-            api_messages.append({
-                "role": "assistant",
-                "content": text_content or None,
-                "tool_calls": tc_list
-            })
+            api_messages.append(_assistant_history_message(
+                text_content, reasoning_content, tc_list))
 
             # Execute tools
             loop = asyncio.get_running_loop()
@@ -756,7 +776,13 @@ async def agent_loop(req_id: str, messages: list, model: str, thinking: bool,
                 except ValueError as error:
                     output, is_error = str(error), True
                 else:
-                    if requires_approval(tc_name, tc_args):
+                    if (not voice_may_authorize_sensitive(transcript_assessment) and
+                            requires_approval(tc_name, tc_args)):
+                        output, is_error = (
+                            "Sensitive action rejected: uncertain voice transcript cannot authorize it",
+                            True,
+                        )
+                    elif requires_approval(tc_name, tc_args):
                         approved = await approvals.request(
                             req_id, tc["id"], tc_name, tc_args,
                             on_pending=lambda: emit({
@@ -912,7 +938,9 @@ async def main() -> None:
                             req.get("thinking", False),
                         )
                     )
-                    visible_payload = prepared
+                    visible_payload = copy.deepcopy(prepared)
+                    prepared["_atlas_transcript_assessment"] = req.get(
+                        "transcript_assessment", "ACCEPT")
                 token = cloud_previews.issue(req["id"], prepared)
                 emit({
                     "type": "cloud_preview", "id": req["id"], "token": token,

@@ -17,6 +17,7 @@ import android.view.KeyEvent
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
+import com.madhu.atlas.AtlasApp
 import com.madhu.atlas.agent.Tool
 import com.madhu.atlas.agent.ToolResult
 import com.madhu.atlas.agent.ToolSpec
@@ -65,7 +66,7 @@ fun deviceTools(context: Context): List<Tool> {
             val i = Intent(AlarmClock.ACTION_SET_ALARM)
                 .putExtra(AlarmClock.EXTRA_HOUR, hour)
                 .putExtra(AlarmClock.EXTRA_MINUTES, minute)
-                .putExtra(AlarmClock.EXTRA_SKIP_UI, true)   // create it directly, don't make the user finish
+                .putExtra(AlarmClock.EXTRA_SKIP_UI, false)
             a.str("message")?.let { i.putExtra(AlarmClock.EXTRA_MESSAGE, it) }
             fired(app, i, "Alarm set for %02d:%02d.".format(hour, minute))
         },
@@ -74,7 +75,7 @@ fun deviceTools(context: Context): List<Tool> {
             val mins = a.int("minutes") ?: 1
             val i = Intent(AlarmClock.ACTION_SET_TIMER)
                 .putExtra(AlarmClock.EXTRA_LENGTH, mins * 60)
-                .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                .putExtra(AlarmClock.EXTRA_SKIP_UI, false)
             a.str("message")?.let { i.putExtra(AlarmClock.EXTRA_MESSAGE, it) }
             fired(app, i, "Timer started for $mins minute(s).")
         },
@@ -104,51 +105,13 @@ fun deviceTools(context: Context): List<Tool> {
                 else -> ok(hits.take(5).joinToString("; ") { "${it.name} — ${it.number}" })
             }
         },
-        tool("call_number",
-            "Place a phone call to a number. Only call after the user has confirmed. " +
-                "For a person, use find_contact first to get the number.",
+        tool("open_dialer",
+            "Open the Android dialer with a validated number. The user must place the call.",
             obj("number" to str("Phone number to call")),"number") { a ->
             val num = (a.str("number") ?: return@tool bad("number required"))
                 .filter { it.isDigit() || it == '+' }
             if (num.isEmpty()) return@tool bad("That doesn't look like a phone number.")
-            // Actually place the call when CALL_PHONE is granted; otherwise open the dialer.
-            val canCall = androidx.core.content.ContextCompat.checkSelfPermission(
-                app, android.Manifest.permission.CALL_PHONE
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            val action = if (canCall) Intent.ACTION_CALL else Intent.ACTION_DIAL
-            val msg = if (canCall) "Calling $num." else "Dialer open for $num (grant call permission to dial automatically)."
-            fired(app, Intent(action, Uri.parse("tel:$num")), msg)
-        },
-        tool("answer_call", "Answer the currently ringing incoming call.", obj()) { _ ->
-            if (CallControl.answer(app)) ok("Answered the call.")
-            else bad("Couldn't answer — no ringing call, or the phone permission isn't granted.")
-        },
-        tool("end_call", "Reject the ringing call or hang up the current call.", obj()) { _ ->
-            if (CallControl.end(app)) ok("Ended the call.")
-            else bad("Couldn't end the call — nothing active, or the phone permission isn't granted.")
-        },
-        tool("reject_with_message",
-            "Reject the incoming call and text the caller a message (e.g. \"I'll call you back\").",
-            obj("message" to str("Message to send the caller")),"message") { a ->
-            val text = a.str("message") ?: return@tool bad("message required")
-            val number = CallState.lastIncomingNumber
-                ?: return@tool bad("I don't have the caller's number (needs call-log permission).")
-            CallControl.end(app)   // reject first
-            val canSms = androidx.core.content.ContextCompat.checkSelfPermission(
-                app, android.Manifest.permission.SEND_SMS
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            if (canSms) {
-                runCatching {
-                    val sms = app.getSystemService(android.telephony.SmsManager::class.java)
-                    sms.sendTextMessage(number, null, text, null, null)
-                }.fold(
-                    onSuccess = { ok("Rejected the call and texted $number.") },
-                    onFailure = { bad("Rejected, but couldn't send the text: ${it.message}") },
-                )
-            } else {
-                val i = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$number")).putExtra("sms_body", text)
-                fired(app, i, "Rejected the call — opened a message to $number.")
-            }
+            fired(app, Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num")), "Opened dialer for $num.")
         },
         tool("send_sms", "Open the SMS composer to a number, optionally prefilled.",
             obj("number" to str("Phone number"), "message" to str("Message")),"number") { a ->
@@ -232,23 +195,44 @@ fun deviceTools(context: Context): List<Tool> {
             am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
             ok("Sent media '$action' to the active player.")
         },
-        tool("play_on_spotify", "Play a song, artist, or playlist on Spotify.",
-            obj("query" to str("What to play")),"query") { a ->
+        // Three distinct Spotify tools — the model picks reliably by intent (far more
+        // robust than one tool with a source flag it kept ignoring).
+        tool("play_song", "Play a song or artist on Spotify (public catalog / any track).",
+            obj("query" to str("Song or artist to play")),"query") { a ->
             val q = a.str("query") ?: return@tool bad("query required")
-            // MEDIA_PLAY_FROM_SEARCH makes Spotify actually start playing the best match,
-            // not just show search results. Fall back progressively if it can't.
-            fun playFromSearch(pkg: String?) = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
-                .putExtra(SearchManager.QUERY, q)
-                .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
-                .apply { if (pkg != null) setPackage(pkg) }
-            when {
-                fire(app, playFromSearch("com.spotify.music")) -> ok("Playing \"$q\" on Spotify.")
-                fire(app, playFromSearch(null)) -> ok("Playing \"$q\".")
-                fire(app, Intent(Intent.ACTION_VIEW, Uri.parse("spotify:search:" + Uri.encode(q)))
-                        .setPackage("com.spotify.music")) -> ok("Opened Spotify for \"$q\".")
-                else -> fired(app, Intent(Intent.ACTION_VIEW,
-                    Uri.parse("https://open.spotify.com/search/" + Uri.encode(q))), "Opened Spotify search for \"$q\".")
+            if (SpotifyController.configured) {
+                val secrets = (app as AtlasApp).container.secrets
+                val uri = SpotifyController.searchCatalog(q, secrets)
+                if (uri != null && SpotifyController.play(app, uri)) return@tool ok("Playing \"$q\".")
             }
+            playViaIntent(app, q)
+        },
+        tool("play_liked",
+            "Play from the user's OWN Spotify Liked Songs. Use when they say 'my liked songs' " +
+                "or 'my saved songs'. Requires a connected Spotify account.",
+            obj("query" to str("A song in their liked songs; leave empty to play all liked"))) { a ->
+            val secrets = (app as AtlasApp).container.secrets
+            if (!SpotifyController.configured || !SpotifyController.connected(secrets))
+                return@tool bad("Connect your Spotify account in Settings first.")
+            val q = a.str("query").orEmpty()
+            val uri = SpotifyController.searchLiked(q, secrets)
+                ?: return@tool bad(if (q.isBlank()) "Your Liked Songs looks empty." else "\"$q\" isn't in your Liked Songs.")
+            if (SpotifyController.play(app, uri))
+                ok(if (q.isBlank()) "Playing your Liked Songs." else "Playing \"$q\" from your Liked Songs.")
+            else bad("Found it but couldn't start playback.")
+        },
+        tool("play_playlist",
+            "Play one of the user's OWN Spotify playlists by name. Use when they say " +
+                "'my <name> playlist' or 'play my <name>'. Requires a connected Spotify account.",
+            obj("name" to str("The playlist name")),"name") { a ->
+            val secrets = (app as AtlasApp).container.secrets
+            if (!SpotifyController.configured || !SpotifyController.connected(secrets))
+                return@tool bad("Connect your Spotify account in Settings first.")
+            val name = a.str("name") ?: return@tool bad("name required")
+            val uri = SpotifyController.findPlaylist(name, secrets)
+                ?: return@tool bad("You don't have a playlist matching \"$name\".")
+            if (SpotifyController.play(app, uri)) ok("Playing your \"$name\" playlist.")
+            else bad("Found the playlist but couldn't start playback.")
         },
         tool("toggle_flashlight", "Turn the flashlight/torch on or off.",
             obj("on" to bool("true = on, false = off"))) { a ->
@@ -365,6 +349,32 @@ private fun fire(context: Context, intent: Intent): Boolean = try {
 
 private fun fired(context: Context, intent: Intent, success: String): ToolResult =
     if (fire(context, intent)) ok(success) else bad("No app available to handle that.")
+
+/** Fallback catalog play via intents (used when the App Remote path isn't available). */
+private suspend fun playViaIntent(app: Context, q: String): ToolResult {
+    fun playFromSearch(pkg: String?) = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
+        .putExtra(SearchManager.QUERY, q)
+        .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/audio")
+        .putExtra(MediaStore.EXTRA_MEDIA_TITLE, q)
+        .apply { if (pkg != null) setPackage(pkg) }
+    val launched = when {
+        fire(app, playFromSearch("com.spotify.music")) -> true
+        fire(app, playFromSearch(null)) -> true
+        fire(app, Intent(Intent.ACTION_VIEW, Uri.parse("spotify:search:" + Uri.encode(q)))
+            .setPackage("com.spotify.music")) -> true
+        else -> { fired(app, Intent(Intent.ACTION_VIEW,
+            Uri.parse("https://open.spotify.com/search/" + Uri.encode(q))), "Opened Spotify."); false }
+    }
+    if (launched) {
+        // Nudge playback: some setups load the track but don't auto-start. Use a PLAY
+        // (not play/pause) key so it never pauses something already playing.
+        kotlinx.coroutines.delay(1800)
+        val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY))
+        am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY))
+    }
+    return ok("Playing \"$q\" on Spotify.")
+}
 
 private fun JsonObject.str(key: String): String? =
     this[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }

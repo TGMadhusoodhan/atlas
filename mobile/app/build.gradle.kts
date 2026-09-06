@@ -1,9 +1,18 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
 }
+
+// Spotify credentials come from local.properties (gitignored) — never committed.
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val spotifyClientId: String = localProps.getProperty("spotify.clientId", "")
 
 android {
     namespace = "com.madhu.atlas"
@@ -17,6 +26,13 @@ android {
         versionName = "0.1.0-m1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Spotify App Remote config (blank → SDK path skipped, intent fallback used).
+        buildConfigField("String", "SPOTIFY_CLIENT_ID", "\"$spotifyClientId\"")
+        buildConfigField("String", "SPOTIFY_REDIRECT_URI", "\"com.madhu.atlas://callback\"")
+        // Redirect URI split for the Spotify Auth library's manifest receiver.
+        manifestPlaceholders["redirectSchemeName"] = "com.madhu.atlas"
+        manifestPlaceholders["redirectHostName"] = "callback"
 
         // The Genie/QNN NDK bridge (M1 step 5) builds for arm64 only — that's the
         // only ABI the phone uses and the only one the QNN runtime ships for here.
@@ -61,6 +77,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     packaging {
         resources {
@@ -98,12 +115,6 @@ dependencies {
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
 
-    // On-device embeddings: ONNX Runtime Mobile (all-MiniLM-L6-v2).
-    // 1.28.0+ ships 16 KB-page-aligned native libs (required for Android 15 / the
-    // Snapdragon 8 Elite Gen 5, which boots with 16 KB memory pages). 1.20.0's
-    // libonnxruntime4j_jni.so was only 4 KB-aligned and would fail to load there.
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0")
-
     // Security: biometric app-lock (secret encryption uses the Android Keystore
     // directly in data/Secrets.kt — no Jetpack Security dependency).
     implementation("androidx.biometric:biometric:1.1.0")
@@ -118,6 +129,13 @@ dependencies {
     // and offline command STT — no account, nothing leaves the device.
     // (TTS uses the built-in android.speech.tts.TextToSpeech — no dependency.)
     implementation("com.alphacephei:vosk-android:0.3.75")
+
+    // Spotify App Remote (playback) + Auth (account login for library access). The .aars
+    // are downloaded into app/libs/ (gitignored) per Spotify's licence; gson is App
+    // Remote's runtime dep, androidx.browser is Auth's (Custom Tabs consent screen).
+    implementation(files("libs/spotify-app-remote-release-0.8.0.aar"))
+    implementation("com.google.code.gson:gson:2.10.1")
+    implementation("androidx.browser:browser:1.8.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("androidx.compose.ui:ui-tooling-preview")

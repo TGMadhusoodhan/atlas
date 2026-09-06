@@ -2,8 +2,12 @@ import queue
 import threading
 import time
 import unittest
+from collections import deque
+from unittest.mock import patch
 
-from voice_helper import AIHelper, VoiceSession
+from asr_runtime import Assessment
+from voice_helper import (AIHelper, VoiceSession, assessment_may_proceed, build_recorder,
+                          needs_transcript_confirmation)
 
 
 class NextUtteranceTest(unittest.TestCase):
@@ -27,6 +31,53 @@ class NextUtteranceTest(unittest.TestCase):
 
         self.assertIsNone(session._next_utterance(0.02))
         self.assertGreaterEqual(time.monotonic() - started, 0.015)
+
+
+class RecorderDefaultsTest(unittest.TestCase):
+    @patch("voice_helper.WhisperExecutor", return_value=object())
+    @patch("voice_helper.select_input_device", return_value=None)
+    @patch("voice_helper.enumerate_input_devices", return_value=[{
+        "index": 1, "name": "Mic", "host_api": "PipeWire", "channels": 1,
+        "sample_rate": 16000,
+    }])
+    def test_absent_values_use_phase_one_baseline(self, _devices, _select, _executor):
+        captured = {}
+
+        class Recorder:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with patch.dict("sys.modules", {"RealtimeSTT": type(
+                "RealtimeSTT", (), {"AudioToTextRecorder": Recorder})}):
+            build_recorder({"stt": {}}, lambda: None, lambda: None)
+
+        self.assertEqual(.45, captured["post_speech_silence_duration"])
+        self.assertEqual(.35, captured["min_length_of_recording"])
+        self.assertEqual(.30, captured["pre_recording_buffer_duration"])
+        self.assertEqual(.50, captured["silero_sensitivity"])
+        self.assertEqual(2, captured["webrtc_sensitivity"])
+        self.assertTrue(captured["silero_deactivity_detection"])
+        self.assertFalse(captured["normalize_audio"])
+        self.assertEqual(0, captured["batch_size"])
+        self.assertEqual(5, captured["beam_size"])
+
+    @patch("voice_helper.WhisperExecutor", return_value=object())
+    @patch("voice_helper.select_input_device", return_value=None)
+    @patch("voice_helper.enumerate_input_devices", return_value=[{
+        "index": 1, "name": "Mic", "host_api": "PipeWire", "channels": 1,
+        "sample_rate": 16000,
+    }])
+    def test_explicit_end_silence_is_preserved(self, _devices, _select, _executor):
+        captured = {}
+
+        class Recorder:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with patch.dict("sys.modules", {"RealtimeSTT": type(
+                "RealtimeSTT", (), {"AudioToTextRecorder": Recorder})}):
+            build_recorder({"stt": {"end_silence": .6}}, lambda: None, lambda: None)
+        self.assertEqual(.6, captured["post_speech_silence_duration"])
 
 
 class SpokenApprovalTest(unittest.TestCase):
@@ -99,12 +150,164 @@ class SpokenApprovalTest(unittest.TestCase):
         session._tts = type("TTS", (), {"speaking": True, "started_at": 0})()
         session._barge_in = False
         session._user_speaking = False
-        session._recording_started_during_tts = False
+        session._recording_lock = threading.Lock()
+        session._recording_sequence = 0
+        session._recordings = deque()
+        session._listener_generation = 7
 
         session._on_recording_start()
         session._tts.speaking = False
 
-        self.assertTrue(session._recording_started_during_tts)
+        self.assertTrue(session._recordings[0].possible_echo)
+        self.assertEqual(7, session._recordings[0].generation)
+
+
+class TranscriptConfirmationTest(unittest.TestCase):
+    def make_session(self, response=None, active=True):
+        session = VoiceSession.__new__(VoiceSession)
+        session.cfg = {"uncertainty": {"confirmation_timeout": 0.02}}
+        session._active = active
+        session._utterances = queue.Queue()
+        if response is not None:
+            session._utterances.put((response, None))
+        session._tts = type("TTS", (), {"speak_sync": lambda self, text: None})()
+        return session
+
+    def test_uncertain_only_confirms_in_enforced_mode(self):
+        self.assertTrue(needs_transcript_confirmation("enforce", Assessment.UNCERTAIN))
+        self.assertFalse(needs_transcript_confirmation("shadow", Assessment.UNCERTAIN))
+        self.assertFalse(needs_transcript_confirmation("enforce", Assessment.ACCEPT))
+
+    def test_shadow_uncertain_proceeds_but_noise_and_hallucination_do_not(self):
+        self.assertTrue(assessment_may_proceed("shadow", Assessment.UNCERTAIN))
+        self.assertTrue(assessment_may_proceed("shadow", Assessment.ACCEPT))
+        self.assertFalse(assessment_may_proceed("shadow", Assessment.SILENCE))
+        self.assertFalse(assessment_may_proceed("shadow", Assessment.HALLUCINATION))
+
+    def test_yes_sends_original_transcript(self):
+        session = self.make_session("yes")
+        original = "open the Atlas project"
+        self.assertTrue(session._confirm_transcript(original))
+
+    def test_no_repeat_and_cancel_discard(self):
+        for response in ("no", "repeat", "cancel"):
+            with self.subTest(response=response):
+                self.assertFalse(self.make_session(response)._confirm_transcript("original"))
+
+    def test_silence_discards(self):
+        self.assertFalse(self.make_session()._confirm_transcript("original"))
+
+    def test_session_cancel_discards(self):
+        self.assertFalse(self.make_session(active=False)._confirm_transcript("original"))
+
+    def test_confirmation_words_are_not_assessed_recursively(self):
+        session = self.make_session("yes")
+        session.cfg["uncertainty"]["min_avg_logprob"] = 100
+        self.assertTrue(session._confirm_transcript("original"))
+
+
+class ListenerLifecycleTest(unittest.TestCase):
+    def make_session(self):
+        session = VoiceSession.__new__(VoiceSession)
+        session._active = True
+        session._lifecycle_lock = threading.RLock()
+        session._listener_generation = 4
+        session._listener_thread = None
+        session._listener_stop = None
+        session._recording_lock = threading.Lock()
+        session._recording_sequence = 0
+        session._recordings = deque()
+        session._diagnostics = None
+        session._user_speaking = False
+        session._speech_ended_at = None
+        session._last_evidence = None
+        session._barge_in = False
+        session._barge_grace = .8
+        session._tts = type("TTS", (), {
+            "speaking": False, "started_at": 0.0, "stop": lambda self: None,
+        })()
+        session._ai = type("AI", (), {"cancel": lambda self: None})()
+        session._approval_pending = threading.Event()
+        session._approval_utterances = queue.Queue()
+        session._utterances = queue.Queue()
+        return session
+
+    def test_duplicate_vad_callbacks_create_one_utterance(self):
+        session = self.make_session()
+        session._on_recording_start()
+        session._on_recording_start()
+        session._on_recording_stop()
+        session._on_recording_stop()
+        self.assertEqual(1, session._recording_sequence)
+        self.assertEqual(1, len(session._recordings))
+
+    def test_atomic_one_shot_yields_exactly_one_ai_turn_candidate(self):
+        session = self.make_session()
+        session._on_recording_start()
+        session._on_recording_stop()
+        self.assertTrue(session._accept_transcription_result(4, "hello", None, 10.0))
+        self.assertFalse(session._accept_transcription_result(4, "hello", None, 11.0))
+        self.assertEqual(1, session._utterances.qsize())
+
+    def test_delayed_echo_remains_tainted_after_tts_stops(self):
+        session = self.make_session()
+        session._tts.speaking = True
+        session._tts.started_at = time.monotonic()
+        session._on_recording_start()
+        session._on_recording_stop()
+        session._tts.speaking = False
+        self.assertFalse(session._accept_transcription_result(4, "piper echo", None, 500.0))
+        self.assertTrue(session._utterances.empty())
+
+    def test_late_result_from_retired_generation_is_discarded(self):
+        session = self.make_session()
+        session._on_recording_start()
+        session._on_recording_stop()
+        session._listener_generation = 5
+        self.assertFalse(session._accept_transcription_result(4, "late", None, 500.0))
+        self.assertTrue(session._utterances.empty())
+
+    def test_restart_joins_previous_listener_before_new_listener_runs(self):
+        session = self.make_session()
+
+        class BlockingRecorder:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.current = None
+                self.active_calls = 0
+                self.max_active_calls = 0
+                self.started = threading.Event()
+
+            def text(self):
+                release = threading.Event()
+                with self.lock:
+                    self.current = release
+                    self.active_calls += 1
+                    self.max_active_calls = max(self.max_active_calls, self.active_calls)
+                    self.started.set()
+                release.wait(2)
+                with self.lock:
+                    self.active_calls -= 1
+                return "late result"
+
+            def abort(self):
+                with self.lock:
+                    release = self.current
+                if release:
+                    release.set()
+
+        recorder = BlockingRecorder()
+        session._recorder = recorder
+        session._start_listener()
+        self.assertTrue(recorder.started.wait(1))
+        recorder.started.clear()
+        first = session._listener_thread
+        session._start_listener()
+        self.assertFalse(first.is_alive())
+        self.assertTrue(recorder.started.wait(1))
+        self.assertEqual(1, recorder.max_active_calls)
+        session._active = False
+        session._retire_listener()
 
 
 if __name__ == "__main__":
