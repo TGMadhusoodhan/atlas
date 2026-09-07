@@ -3,3 +3,6 @@ ctranslate2>=4.8.1,<4.9
 numpy>=2.0,<3
 piper-tts>=1.3.0,<2
 RealtimeSTT>=1.0.2,<1.1
+# Voice M2 native-channel lab and stateful anti-alias frontend
+scipy>=1.17.1,<2
+soundfile>=0.13.1,<0.14

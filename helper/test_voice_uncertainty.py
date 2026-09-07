@@ -12,6 +12,8 @@ class VoiceUncertaintyTest(unittest.TestCase):
     def test_uncertain_shadow_transcript_cannot_authorize_sensitive_action(self):
         self.assertFalse(voice_may_authorize_sensitive("UNCERTAIN"))
         self.assertTrue(voice_may_authorize_sensitive("ACCEPT"))
+        for state in ("CLARIFY", "REJECT", "SILENCE", "HALLUCINATION", "", "unknown", None):
+            self.assertFalse(voice_may_authorize_sensitive(state))
 
 
 if __name__ == "__main__":

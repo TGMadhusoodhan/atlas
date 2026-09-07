@@ -49,3 +49,12 @@ mobile/app/src/main/assets/vosk-model/**
 
 # ── OS ──────────────────────────────────────────────────────────────────
 .DS_Store
+
+# Voice M2: personal audio and local evaluation artifacts must stay local.
+*.wav
+*.flac
+*.pcm
+*.raw
+voice/local-data/
+voice/results/
+realtimesst.log

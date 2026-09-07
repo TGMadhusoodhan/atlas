@@ -3,9 +3,11 @@ import threading
 import time
 import unittest
 from collections import deque
+from dataclasses import replace
 from unittest.mock import patch
 
 from asr_runtime import Assessment
+from test_asr_runtime import evidence
 from voice_helper import (AIHelper, VoiceSession, assessment_may_proceed, build_recorder,
                           needs_transcript_confirmation)
 
@@ -133,7 +135,7 @@ class SpokenApprovalTest(unittest.TestCase):
 
         class PromptingTTS:
             def speak_sync(self, _text):
-                session._approval_utterances.put("Yes")
+                session._approval_utterances.put(("Yes", evidence("Yes")))
 
         session._tts = PromptingTTS()
         approved = session._handle_tool_approval({
@@ -168,18 +170,20 @@ class TranscriptConfirmationTest(unittest.TestCase):
         session.cfg = {"uncertainty": {"confirmation_timeout": 0.02}}
         session._active = active
         session._utterances = queue.Queue()
-        if response is not None:
-            session._utterances.put((response, None))
-        session._tts = type("TTS", (), {"speak_sync": lambda self, text: None})()
+        def speak(_self, text):
+            if response is not None and text.startswith("I heard:"):
+                session._utterances.put((response, replace(evidence(response),
+                    timings={"speech_onset": time.monotonic()})))
+        session._tts = type("TTS", (), {"speak_sync": speak})()
         return session
 
-    def test_uncertain_only_confirms_in_enforced_mode(self):
+    def test_uncertain_confirms_even_in_legacy_shadow_mode(self):
         self.assertTrue(needs_transcript_confirmation("enforce", Assessment.UNCERTAIN))
-        self.assertFalse(needs_transcript_confirmation("shadow", Assessment.UNCERTAIN))
+        self.assertTrue(needs_transcript_confirmation("shadow", Assessment.UNCERTAIN))
         self.assertFalse(needs_transcript_confirmation("enforce", Assessment.ACCEPT))
 
-    def test_shadow_uncertain_proceeds_but_noise_and_hallucination_do_not(self):
-        self.assertTrue(assessment_may_proceed("shadow", Assessment.UNCERTAIN))
+    def test_shadow_cannot_bypass_assessment(self):
+        self.assertFalse(assessment_may_proceed("shadow", Assessment.UNCERTAIN))
         self.assertTrue(assessment_may_proceed("shadow", Assessment.ACCEPT))
         self.assertFalse(assessment_may_proceed("shadow", Assessment.SILENCE))
         self.assertFalse(assessment_may_proceed("shadow", Assessment.HALLUCINATION))
@@ -200,10 +204,15 @@ class TranscriptConfirmationTest(unittest.TestCase):
     def test_session_cancel_discards(self):
         self.assertFalse(self.make_session(active=False)._confirm_transcript("original"))
 
-    def test_confirmation_words_are_not_assessed_recursively(self):
-        session = self.make_session("yes")
-        session.cfg["uncertainty"]["min_avg_logprob"] = 100
-        self.assertTrue(session._confirm_transcript("original"))
+    def test_confirmation_missing_evidence_cannot_upgrade_original(self):
+        session = self.make_session()
+        session._tts.speak_sync = lambda text: session._utterances.put(("yes", None))
+        self.assertFalse(session._confirm_transcript("original"))
+
+    def test_confirmation_bad_evidence_does_not_recurse(self):
+        session = self.make_session()
+        session._tts.speak_sync = lambda text: session._utterances.put(("yes", evidence("yes", no_speech=.99)))
+        self.assertFalse(session._confirm_transcript("original"))
 
 
 class ListenerLifecycleTest(unittest.TestCase):

@@ -21,8 +21,8 @@ Protocol (line-delimited JSON on stdin/stdout, like ai_helper.py):
 
 Config: ~/.config/ai-sidebar/voice.toml (auto-created with defaults on first run).
 
-Barge-in with speakers can echo (mic hears ATLAS). Use headphones for flawless
-barge-in, or set up PipeWire echo-cancellation.
+Speaker barge-in requires tested playback-referenced echo cancellation.
+It remains disabled until the built-in microphone path has been evaluated.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 try:
@@ -53,7 +53,7 @@ if str(HELPER_DIR) not in sys.path:
     sys.path.insert(0, str(HELPER_DIR))
 
 from capabilities import system_prompt
-from asr_runtime import (Assessment, AudioDiagnostics, CalibrationLogger, WhisperExecutor,
+from asr_runtime import (Assessment, AudioDiagnostics, CalibrationLogger, WhisperExecutor, CascadedExecutor,
                          assess_transcript, enumerate_input_devices, select_input_device)
 
 DEFAULT_CONFIG = """\
@@ -75,17 +75,32 @@ beam_size = 5
 # microphone_name = "PipeWire:Your microphone" # preferred stable identity
 # microphone_index = 3                          # explicit fallback
 microphone_fallback = false
-# vocabulary = ["Atlas", "Hyprland", "CTranslate2", "RealtimeSTT"]
+# source_name = "alsa_input.<your internal device>.analog-stereo"
+# vocabulary = ["your project"]  # added to the built-in technical terms
+
+[frontend]
+pipewire_capture = true  # explicit target and unity stream gain for pinned sources
+native_capture = false
+channel = "average"  # select a numeric channel only after mic_lab evaluation
+
+[cascade]
+enabled = false
+# model = "medium.en"  # benchmark and cache before enabling
 
 [uncertainty]
-mode = "shadow"
-min_avg_logprob = -0.65
+mode = "enforce"
+accept_avg_logprob = -0.35
+accept_no_speech_prob = 0.20
+accept_vad_probability = 0.80
+accept_snr_db = 10.0
+accept_max_temperature = 0.0
 silence_no_speech_prob = 0.70
 max_compression_ratio = 2.4
 max_temperature = 0.5
 hallucination_repeats = 3
 # calibration_log = "~/.local/state/ai-sidebar/asr-calibration.jsonl"
 store_transcripts = false
+# telemetry_log = "~/.local/state/ai-sidebar/voice-m2-metrics.jsonl"
 
 [convo]
 silence_timeout = 6.0          # end the conversation after this many seconds of no speech
@@ -193,13 +208,12 @@ def report_stt_baseline_differences(cfg: dict) -> None:
 
 
 def needs_transcript_confirmation(mode: str, assessment: Assessment) -> bool:
-    return mode == "enforce" and assessment is Assessment.UNCERTAIN
+    return assessment is Assessment.CLARIFY
 
 
 def assessment_may_proceed(mode: str, assessment: Assessment) -> bool:
-    if assessment in {Assessment.SILENCE, Assessment.HALLUCINATION}:
-        return False
-    return assessment is not Assessment.UNCERTAIN or mode == "shadow"
+    # Legacy shadow configurations no longer bypass transcript trust.
+    return assessment is Assessment.ACCEPT
 
 
 @dataclass
@@ -209,6 +223,7 @@ class RecordingContext:
     possible_echo: bool
     stopped_at: float | None = None
     claimed: bool = False
+    started_at: float | None = None
 
 
 # ── Streaming sentence splitter ───────────────────────────────────────────────
@@ -436,24 +451,49 @@ class PiperTTS:
 def build_recorder(cfg: dict, on_recording_start, on_recording_stop, on_chunk=None):
     from RealtimeSTT import AudioToTextRecorder
     stt = cfg.get("stt", {})
-    devices = enumerate_input_devices()
+    native = cfg.get("frontend", {}).get("native_capture", False)
+    direct = bool(stt.get("source_name")) and cfg.get("frontend", {}).get("pipewire_capture", True)
+    if stt.get("source_name"):
+        from capture_source import pin_pulse_source
+        source = pin_pulse_source(stt["source_name"],
+                                 require_internal=not stt.get("processed_source", False))
+        log(f"pinned capture source={source['name']} format={source.get('sample_specification')}")
+        stt = {**stt, "microphone_name": "ALSA:pulse", "microphone_fallback": False}
+    devices = [] if direct else enumerate_input_devices()
     for d in devices:
         log("microphone: index={index} name={name!r} host_api={host_api!r} "
-            "channels={channels} default_sample_rate={sample_rate}".format(**d))
-    selected = select_input_device(devices, stt.get("microphone_name"),
+            "max_input_channels={channels} backend_default_sample_rate={sample_rate}".format(**d))
+    selected = None if direct else select_input_device(devices, stt.get("microphone_name"),
                                    stt.get("microphone_index"),
                                    bool(stt.get("microphone_fallback", False)))
-    if selected and selected["channels"] != 1:
+    if selected and not stt.get("source_name") and selected["channels"] != 1:
         log(f"WARNING: microphone exposes {selected['channels']} channels; Atlas captures mono")
-    if selected and selected["sample_rate"] != 16000:
+    if selected and not stt.get("source_name") and selected["sample_rate"] != 16000:
         log(f"audio: device default {selected['sample_rate']} Hz; RealtimeSTT will resample to 16000 Hz")
     model = cfg_get(cfg, "stt", "model", default="small.en")
-    vocabulary = stt.get("vocabulary", [])
+    from vocabulary import desktop_vocabulary
+    provider = lambda: desktop_vocabulary(stt.get("vocabulary", []),
+        stt.get("project_paths", [str(Path(__file__).resolve().parents[1])]),
+        stt.get("tool_vocabulary", ["open_app", "set_volume", "play_pause"]))
+    vocabulary = provider()
     executor = WhisperExecutor(model, cfg_get(cfg, "stt", "device", default="cuda"),
                                cfg_get(cfg, "stt", "compute", default="int8_float16"),
                                int(stt.get("beam_size", 5)), vocabulary)
+    cascade = cfg.get("cascade", {})
+    fallback_factory = None
+    if cascade.get("enabled", False):
+        if not cascade.get("model"):
+            raise ValueError("Choose a benchmarked cascade.model before enabling fallback")
+        fallback_factory = lambda: WhisperExecutor(cascade["model"], stt.get("device", "cuda"),
+            stt.get("compute", "int8_float16"), int(stt.get("beam_size", 5)), vocabulary,
+            local_files_only=True)
+    executor = CascadedExecutor(executor, fallback_factory, cfg.get("uncertainty", {}), provider)
     build_recorder.executor = executor
-    return AudioToTextRecorder(
+    if stt.get("source_name"):
+        from capture_source import verify_pulse_capture
+        executor.capture_validator = lambda: verify_pulse_capture(stt["source_name"],
+            require_internal=not stt.get("processed_source", False))
+    recorder = AudioToTextRecorder(
         model=model,
         language=cfg_get(cfg, "stt", "language", default="en"),
         device=cfg_get(cfg, "stt", "device", default="cuda"),
@@ -468,10 +508,35 @@ def build_recorder(cfg: dict, on_recording_start, on_recording_stop, on_chunk=No
         batch_size=int(stt.get("batch_size", 0)), beam_size=int(stt.get("beam_size", 5)),
         input_device_index=selected["index"] if selected else None,
         on_recorded_chunk=on_chunk, transcription_executor=executor,
-        spinner=False,
+        spinner=False, no_log_file=True, use_microphone=not (native or direct),
         on_recording_start=on_recording_start,
         on_recording_stop=on_recording_stop,
     )
+    if native or direct:
+        from native_capture import NativeCapture
+        try:
+            recorder.atlas_capture = NativeCapture(recorder, stt["source_name"],
+                channel=cfg.get("frontend", {}).get("channel", "average"),
+                processed=stt.get("processed_source", False), native=native)
+            if not recorder.atlas_capture.ready.wait(8) or recorder.atlas_capture.failure:
+                raise RuntimeError(recorder.atlas_capture.failure or "PipeWire capture startup timed out")
+        except Exception:
+            capture = getattr(recorder, "atlas_capture", None)
+            if capture:
+                capture.close()
+            recorder.shutdown()
+            raise
+    if stt.get("source_name"):
+        from capture_source import wait_for_pulse_capture
+        try:
+            wait_for_pulse_capture(stt["source_name"], require_internal=not stt.get("processed_source",False))
+        except Exception:
+            capture = getattr(recorder, "atlas_capture", None)
+            if capture:
+                capture.close()
+            recorder.shutdown()
+            raise
+    return recorder
 
 
 # ── Exit-phrase detection ─────────────────────────────────────────────────────
@@ -519,9 +584,11 @@ class VoiceSession:
         self._speech_ended_at = None
         self._diagnostics = None
         uncertainty = cfg.get("uncertainty", {})
-        self._uncertainty_mode = str(uncertainty.get("mode", "shadow")).lower()
+        self._uncertainty_mode = str(uncertainty.get("mode", "enforce")).lower()
         if self._uncertainty_mode not in {"shadow", "enforce"}:
             raise ValueError("uncertainty.mode must be 'shadow' or 'enforce'")
+        from telemetry import PipelineTelemetry
+        self._telemetry = PipelineTelemetry(uncertainty.get("telemetry_log"))
         self._calibration = CalibrationLogger(
             uncertainty.get("calibration_log"), bool(uncertainty.get("store_transcripts", False)))
         self._utterances: queue.Queue = queue.Queue()
@@ -545,7 +612,7 @@ class VoiceSession:
                 return
             self._recording_sequence += 1
             context = RecordingContext(self._listener_generation,
-                                       self._recording_sequence, speaking)
+                                       self._recording_sequence, speaking, started_at=time.monotonic())
             self._recordings.append(context)
         tts_age = (time.monotonic() - self._tts.started_at
                    if speaking and self._tts else None)
@@ -692,18 +759,25 @@ class VoiceSession:
                                      evidence, latency_ms: float | None) -> bool:
         context = self._claim_recording(generation)
         if context is None:
-            log(f"discarded uncorrelated/duplicate transcript from generation={generation}: {text!r}")
-            return False
-        if not text:
-            log(f"discarded empty transcript for utterance={context.utterance_id}")
+            log(f"discarded uncorrelated/duplicate transcript from generation={generation}")
             return False
         if generation != self._listener_generation:
             log(f"discarded late transcript from retired generation={generation} "
                 f"utterance={context.utterance_id}")
             return False
         if not self._barge_in and context.possible_echo:
-            log(f"ignored echo-tainted utterance={context.utterance_id}: {text!r}")
+            telemetry = getattr(self, "_telemetry", None)
+            if telemetry:
+                telemetry.record(evidence, "REJECT", utterance_id=context.utterance_id)
+            log(f"ignored echo-tainted utterance={context.utterance_id}")
             return False
+        if evidence is not None:
+            capture = getattr(getattr(self, "_recorder", None), "atlas_capture", None)
+            clipping = capture.source_clipping(context.started_at, context.stopped_at) if capture else None
+            evidence = replace(evidence, possible_echo=context.possible_echo,
+                clipping_fraction=max(evidence.clipping_fraction or 0, clipping) if clipping is not None else evidence.clipping_fraction,
+                timings={**(evidence.timings or {}), "speech_onset": context.started_at,
+                         "speech_end": context.stopped_at})
         if self._approval_pending.is_set():
             self._approval_utterances.put((text, evidence))
         else:
@@ -717,10 +791,17 @@ class VoiceSession:
         log(f"listener thread started generation={generation}")
         while self._listener_is_current(generation, stop_event):
             try:
+                capture = getattr(self._recorder, "atlas_capture", None)
+                if capture and capture.failure:
+                    raise RuntimeError(capture.failure)
                 text = self._recorder.text()
+                if capture and capture.failure:
+                    raise RuntimeError(capture.failure)
             except Exception as e:
                 if self._listener_is_current(generation, stop_event):
                     log("recorder.text() error:", e)
+                    emit({"type": "error", "message": "Voice capture failed: " + str(e)})
+                    self._active = False
                 break
             self._user_speaking = False   # text() returned → this utterance is complete
             if not self._listener_is_current(generation, stop_event):
@@ -733,7 +814,7 @@ class VoiceSession:
             if latency_ms is not None:
                 log(f"speech-end-to-final-transcript latency={latency_ms:.1f}ms")
             if text:
-                log(f"heard utterance: {text!r}")
+                log(f"heard utterance")
             self._accept_transcription_result(
                 generation, text, self._last_evidence, latency_ms)
         log(f"listener thread exited generation={generation}")
@@ -788,13 +869,13 @@ class VoiceSession:
                     evidence = None
                 assessment = assess_transcript(
                     evidence, getattr(self, "cfg", {}).get("uncertainty", {}))
-                if evidence is not None and assessment.kind is not Assessment.ACCEPT:
+                if assessment.kind is not Assessment.ACCEPT:
                     log(f"approval response rejected by uncertainty gate: {assessment.kind.value} "
                         f"{assessment.reasons}")
                     self._tts.speak_sync("I was not confident. Please say yes or no again.")
                     continue
                 decision = self._approval_answer(answer)
-                log(f"approval response: {answer!r} -> {decision}")
+                log(f"approval response decision: {decision}")
                 if decision is not None:
                     state("thinking")
                     return decision
@@ -851,7 +932,9 @@ class VoiceSession:
         return None
 
     def _confirm_transcript(self, transcript: str) -> bool:
-        """Confirm an uncertain original without assessing the confirmation recursively."""
+        """Confirm once; the answer must pass assessment without recursive prompting."""
+        self._drain_queue(self._utterances)
+        asked_at = time.monotonic()
         state("confirming_transcript")
         self._tts.speak_sync(f"I heard: {transcript}. Is that correct? Say yes or no.")
         state("listening")
@@ -863,9 +946,14 @@ class VoiceSession:
             except queue.Empty:
                 continue
             answer = item[0] if isinstance(item, tuple) else item
+            evidence = item[1] if isinstance(item, tuple) and len(item) > 1 else None
             decision = self._confirmation_answer(answer)
-            if decision is not None:
-                return decision
+            if decision is False:
+                return False
+            assessment = assess_transcript(evidence, self.cfg.get("uncertainty", {}))
+            onset = (evidence.timings or {}).get("speech_onset") if evidence else None
+            if decision is True and assessment.kind is Assessment.ACCEPT and onset is not None and onset >= asked_at:
+                return True
             self._tts.speak_sync("Please say yes or no.")
         return False
 
@@ -903,16 +991,15 @@ class VoiceSession:
                 else:
                     transcript, evidence, latency_ms = utterance, self._last_evidence, None
                 first_turn = False
-                log(f"turn: {transcript!r} (tts.speaking={bool(self._tts and self._tts.speaking)})")
-
-                if _is_exit(transcript):
-                    emit({"type": "transcript", "text": transcript})
-                    self._tts.stop()
-                    self._tts.speak_sync("Okay, talk soon.")
-                    break
+                log("processing voice turn")
 
                 assessment = assess_transcript(evidence, self.cfg.get("uncertainty", {}))
-                log(f"ASR assessment: {assessment.kind.value} reasons={assessment.reasons}")
+                log(f"ASR assessment: {assessment.outcome} reasons={assessment.reasons}")
+                if evidence is not None:
+                    evidence = replace(evidence, timings={**(evidence.timings or {}),
+                                                         "transcript_decision": time.monotonic()})
+                self._telemetry.record(evidence, assessment.outcome,
+                    utterance_id=utterance[3] if isinstance(utterance, tuple) and len(utterance) > 3 else None)
                 self._calibration.record(
                     evidence, assessment,
                     latency_ms=latency_ms,
@@ -930,7 +1017,15 @@ class VoiceSession:
                         log("uncertain transcript discarded after confirmation")
                         state("listening")
                         continue
-                    downstream_assessment = Assessment.ACCEPT.value
+                    # Confirmation permits a conversational reply, but does not upgrade
+                    # suspicious evidence into permission for sensitive actions.
+                    downstream_assessment = "CLARIFY"
+
+                if _is_exit(transcript):
+                    emit({"type": "transcript", "text": transcript})
+                    self._tts.stop()
+                    self._tts.speak_sync("Okay, talk soon.")
+                    break
 
                 # New user turn — cut off any reply still playing, then answer.
                 self._tts.stop()
@@ -938,6 +1033,8 @@ class VoiceSession:
                 emit({"type": "transcript", "text": transcript})
                 notify("💬 You said", transcript)
                 state("thinking")
+                self._telemetry.record(evidence, assessment.outcome, handoff=True,
+                    utterance_id=utterance[3] if isinstance(utterance, tuple) and len(utterance) > 3 else None)
                 self._tts.speak_stream_async(self._ai.ask_stream(
                     transcript, transcript_assessment=downstream_assessment))
                 # Wait for the reply to actually start speaking, discarding utterances
@@ -971,6 +1068,9 @@ class VoiceSession:
         self._ai.close()
         try:
             if self._recorder is not None:
+                capture = getattr(self._recorder, "atlas_capture", None)
+                if capture:
+                    capture.close()
                 self._recorder.shutdown()
         except Exception:
             pass

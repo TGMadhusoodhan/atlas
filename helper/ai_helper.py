@@ -65,7 +65,7 @@ OUTPUT_TRUNCATE = 8000
 
 
 def voice_may_authorize_sensitive(transcript_assessment: str) -> bool:
-    return transcript_assessment != "UNCERTAIN"
+    return transcript_assessment == "ACCEPT"
 
 
 def _assistant_history_message(content: str, reasoning_content: str,

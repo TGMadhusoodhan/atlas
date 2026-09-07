@@ -18,7 +18,8 @@ class CalibrationReportTest(unittest.TestCase):
             path.write_text("".join(json.dumps(row) + "\n" for row in rows))
             result = report(path)
         self.assertEqual(1 / 3, result["all"]["bad_accept_rate"])
-        self.assertEqual(1 / 3, result["all"]["false_reject_rate"])
+        self.assertEqual(0, result["all"]["false_reject_rate"])
+        self.assertEqual(1 / 3, result["all"]["clarify_rate"])
         self.assertEqual({"normal_commands", "short_commands", "noise"},
                          set(result["categories"]))
 

@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from collections import Counter, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -18,7 +18,9 @@ import numpy as np
 
 class Assessment(str, Enum):
     ACCEPT = "ACCEPT"
-    UNCERTAIN = "UNCERTAIN"
+    CLARIFY = "CLARIFY"
+    UNCERTAIN = "CLARIFY"  # compatibility alias
+    REJECT = "REJECT"
     SILENCE = "SILENCE"
     HALLUCINATION = "HALLUCINATION"
 
@@ -44,12 +46,30 @@ class TranscriptEvidence:
     compression_ratio: float | None
     max_temperature: float | None
     duration: float
+    vad_probability: float | None = None
+    speech_fraction: float | None = None
+    snr_db: float | None = None
+    rms_dbfs: float | None = None
+    clipping_fraction: float | None = None
+    possible_echo: bool = False
+    consensus: bool | None = None
+    fallback_used: bool = False
+    fallback_error: str | None = None
+    timings: dict | None = None
 
 
 @dataclass(frozen=True)
 class TranscriptAssessment:
     kind: Assessment
     reasons: tuple[str, ...]
+
+    @property
+    def outcome(self):
+        if self.kind is Assessment.ACCEPT:
+            return "ACCEPT"
+        if self.kind is Assessment.CLARIFY:
+            return "CLARIFY"
+        return "REJECT"
 
 
 def enumerate_input_devices() -> list[dict]:
@@ -148,9 +168,10 @@ class AudioDiagnostics:
 class WhisperExecutor:
     """One Whisper model and exactly one final transcribe call per utterance."""
     def __init__(self, model: str, device: str, compute_type: str, beam_size: int,
-                 vocabulary: list[str] | None = None):
+                 vocabulary: list[str] | None = None, *, local_files_only=False):
         from faster_whisper import WhisperModel
-        self.model = WhisperModel(model, device=device, compute_type=compute_type)
+        self.model = WhisperModel(model, device=device, compute_type=compute_type,
+                                  local_files_only=local_files_only)
         self.beam_size = beam_size
         self.vocabulary = [str(term) for term in (vocabulary or []) if str(term).strip()]
         parameters = inspect.signature(self.model.transcribe).parameters
@@ -161,6 +182,10 @@ class WhisperExecutor:
     def transcribe(self, audio, language=None, use_prompt=True):
         from RealtimeSTT.transcription_engines import TranscriptionInfo, TranscriptionResult
 
+        started = time.monotonic()
+        pcm = np.asarray(audio, dtype=np.float32)
+        acoustics = acoustic_evidence(pcm)
+        preprocessed = time.monotonic()
         options = {"language": language, "beam_size": self.beam_size, "vad_filter": True,
                    "condition_on_previous_text": False}
         if use_prompt and self.vocabulary:
@@ -193,7 +218,10 @@ class WhisperExecutor:
             no_speech_prob=max(no_speech) if no_speech else None,
             compression_ratio=max(compression) if compression else None,
             max_temperature=max(temperatures) if temperatures else None,
-            duration=float(getattr(info, "duration", 0.0)))
+            duration=float(getattr(info, "duration", 0.0)), **acoustics,
+            timings={"preprocessing_complete": preprocessed,
+                     "first_asr_complete": time.monotonic(),
+                     "assessment_preprocessing_ms": (preprocessed - started) * 1000})
         result = TranscriptionResult(
             text=text,
             info=TranscriptionInfo(
@@ -223,35 +251,159 @@ def _has_repetition(text: str, minimum_repeats: int = 3) -> bool:
     return False
 
 
+def acoustic_evidence(audio):
+    """Offline Silero evidence over the SAME final PCM passed to the decoder.
+
+    VAD-derived SNR is an estimate, not an independently calibrated microphone SNR.
+    No audio is saved. Failure yields missing evidence and therefore clarification.
+    """
+    from audio_frontend import db
+    x = np.asarray(audio, dtype=np.float32)
+    if x.ndim != 1 or not len(x) or not np.isfinite(x).all():
+        return {}
+    metrics = {"rms_dbfs": db(np.sqrt(np.mean(x.astype(np.float64)**2))),
+               "clipping_fraction": float(np.mean(np.abs(x) >= .999))}
+    try:
+        from faster_whisper.vad import get_vad_model
+        padded = np.pad(x, (0, (-len(x)) % 512))
+        probabilities = np.asarray(get_vad_model()(padded)).reshape(-1)
+        frames = padded.reshape(-1,512)
+        voiced = probabilities >= .5
+        metrics["speech_fraction"] = float(np.mean(voiced))
+        metrics["vad_probability"] = float(np.mean(probabilities[voiced])) if voiced.any() else 0.0
+        # Need at least 3 quiet frames and voiced material; exclude padded tail.
+        valid = np.arange(len(frames)) < len(x) // 512
+        speech, noise = frames[voiced & valid], frames[~voiced & valid]
+        if len(noise) >= 3 and len(speech):
+            noise_power = float(np.mean(noise.astype(np.float64)**2))
+            signal_power = float(np.mean(speech.astype(np.float64)**2))
+            metrics["snr_db"] = 10 * math.log10(max(signal_power-noise_power,1e-18) / max(noise_power,1e-18))
+    except (ImportError, RuntimeError, ValueError):
+        pass
+    return metrics
+
+
 def assess_transcript(evidence: TranscriptEvidence | None, cfg: dict) -> TranscriptAssessment:
-    if evidence is None or not evidence.text.strip() or not evidence.segments:
-        return TranscriptAssessment(Assessment.UNCERTAIN, ("missing transcript or metadata",))
+    """Conservative provisional policy. ACCEPT needs acoustic AND decoder evidence.
+
+    Thresholds are configurable engineering starting points, not calibrated results.
+    Vocabulary membership alone is never proof. Agreement never overrides bad audio.
+    """
+    def decision(kind, *reasons):
+        return TranscriptAssessment(kind, tuple(reasons))
+    if evidence is None:
+        return decision(Assessment.CLARIFY, "missing evidence")
+    if evidence.possible_echo:
+        return decision(Assessment.REJECT, "possible TTS echo")
+    if not evidence.text.strip():
+        return decision(Assessment.SILENCE, "empty decode")
+    if evidence.vad_probability is not None and evidence.vad_probability < float(cfg.get("reject_vad_probability", .2)):
+        return decision(Assessment.REJECT, "no positive speech evidence")
+    if evidence.rms_dbfs is not None and evidence.rms_dbfs < -75:
+        return decision(Assessment.SILENCE, "near-zero captured signal")
     required = (evidence.avg_logprob, evidence.no_speech_prob,
-                evidence.compression_ratio, evidence.max_temperature)
-    if any(value is None for value in required):
-        return TranscriptAssessment(Assessment.UNCERTAIN, ("missing segment metadata",))
-    min_logprob = float(cfg.get("min_avg_logprob", -0.65))
-    silence_no_speech = float(cfg.get("silence_no_speech_prob", 0.70))
-    max_compression = float(cfg.get("max_compression_ratio", 2.4))
-    max_temperature = float(cfg.get("max_temperature", 0.5))
-    low_probability = evidence.avg_logprob < min_logprob
-    if evidence.no_speech_prob >= silence_no_speech and low_probability:
-        return TranscriptAssessment(Assessment.SILENCE,
-                                    ("high no-speech probability plus low log probability",))
+                evidence.compression_ratio, evidence.max_temperature, evidence.duration)
+    if not evidence.segments or any(v is None or not math.isfinite(v) for v in required):
+        return decision(Assessment.CLARIFY, "missing or invalid decoder evidence")
+    probabilities = (evidence.no_speech_prob, evidence.vad_probability,
+                     evidence.speech_fraction, evidence.clipping_fraction)
+    if any(v is not None and (not math.isfinite(v) or not 0 <= v <= 1) for v in probabilities):
+        return decision(Assessment.CLARIFY, "invalid probability or audio fraction")
+    # A confident hallucination cannot cancel out the no-speech signal.
+    if evidence.no_speech_prob >= float(cfg.get("silence_no_speech_prob", .70)):
+        return decision(Assessment.SILENCE, "high no-speech probability")
     repeated = _has_repetition(evidence.text, int(cfg.get("hallucination_repeats", 3)))
-    if evidence.compression_ratio > max_compression and repeated:
-        return TranscriptAssessment(Assessment.HALLUCINATION,
-                                    ("high compression plus repeated decoded text",))
+    if repeated and evidence.compression_ratio > float(cfg.get("max_compression_ratio", 2.4)):
+        return decision(Assessment.HALLUCINATION, "repeated compressed decode")
+    if evidence.clipping_fraction is not None and evidence.clipping_fraction > .02:
+        return decision(Assessment.REJECT, "severe clipping")
     reasons = []
-    if low_probability:
-        reasons.append("low average log probability")
-    if evidence.compression_ratio > max_compression:
-        reasons.append("high compression ratio")
-    if evidence.max_temperature > max_temperature:
-        reasons.append("high decoding temperature")
+    if evidence.consensus is False:
+        reasons.append("ASR passes disagree or fallback failed")
+    if evidence.avg_logprob < float(cfg.get("accept_avg_logprob", -.35)):
+        reasons.append("insufficient decoder probability")
+    if evidence.no_speech_prob > float(cfg.get("accept_no_speech_prob", .20)):
+        reasons.append("ambiguous speech probability")
+    if evidence.compression_ratio > float(cfg.get("max_compression_ratio", 2.4)) or repeated:
+        reasons.append("repetitive decode")
+    if evidence.max_temperature > float(cfg.get("accept_max_temperature", 0.0)):
+        reasons.append("decoder needed temperature fallback")
+    if not .12 <= evidence.duration <= 30:
+        reasons.append("duration outside supported command range")
+    for value, name in ((evidence.vad_probability, "VAD"),
+                        (evidence.speech_fraction, "speech fraction"),
+                        (evidence.rms_dbfs, "audio level"),
+                        (evidence.clipping_fraction, "clipping")):
+        if value is None or not math.isfinite(value):
+            reasons.append("missing " + name + " evidence")
+    if evidence.vad_probability is not None and evidence.vad_probability < float(cfg.get("accept_vad_probability", .8)):
+        reasons.append("weak VAD evidence")
+    if evidence.speech_fraction is not None and evidence.speech_fraction * evidence.duration < .12:
+        reasons.append("too little detected speech")
+    if evidence.clipping_fraction is not None and evidence.clipping_fraction > .001:
+        reasons.append("clipped speech")
+    if evidence.snr_db is None:
+        if evidence.consensus is not True:
+            reasons.append("SNR unavailable and no ASR agreement")
+    elif not math.isfinite(evidence.snr_db) or evidence.snr_db < float(cfg.get("accept_snr_db", 10)):
+        reasons.append("weak estimated SNR")
     if reasons:
-        return TranscriptAssessment(Assessment.UNCERTAIN, tuple(reasons))
-    return TranscriptAssessment(Assessment.ACCEPT, ("within configured thresholds",))
+        return decision(Assessment.CLARIFY, *reasons)
+    return decision(Assessment.ACCEPT, "positive acoustic and decoder evidence")
+
+
+class CascadedExecutor:
+    """Optional lazy second pass on identical PCM. Disagreement never guesses intent."""
+    def __init__(self, fast, fallback_factory=None, cfg=None, vocabulary_provider=None):
+        self.fast, self.fallback_factory = fast, fallback_factory
+        self.fallback = None
+        self.cfg = cfg or {}
+        self.vocabulary_provider = vocabulary_provider
+        self.latest = None
+        self.latest_result = None
+        self.inference_count = 0
+        self.capture_validator = None
+
+    def transcribe(self, audio, language=None, use_prompt=True):
+        if self.capture_validator:
+            self.capture_validator()
+        pcm = np.array(audio, dtype=np.float32, copy=True)
+        pcm.flags.writeable = False
+        if self.vocabulary_provider:
+            self.fast.vocabulary = self.vocabulary_provider()
+        result = self.fast.transcribe(pcm, language=language, use_prompt=use_prompt)
+        first = self.fast.latest
+        self.inference_count += 1
+        evidence = first
+        if assess_transcript(first, self.cfg).kind is Assessment.CLARIFY and self.fallback_factory and first.duration <= 30:
+            try:
+                load_start = time.monotonic()
+                if self.fallback is None:
+                    self.fallback = self.fallback_factory()
+                self.fallback.vocabulary = self.fast.vocabulary
+                result2 = self.fallback.transcribe(pcm, language=language, use_prompt=use_prompt)
+                self.inference_count += 1
+                second = self.fallback.latest
+                normalize = lambda text: re.findall(r"\w+", text.casefold())
+                agreement = normalize(first.text) == normalize(second.text) and bool(normalize(first.text))
+                timings = {**(first.timings or {}), "fallback_asr_complete": time.monotonic(),
+                           "fallback_total_ms": (time.monotonic() - load_start) * 1000}
+                # Keep first acoustic evidence; it describes the identical captured utterance.
+                evidence = replace(second, consensus=agreement, fallback_used=True, timings=timings)
+                result = result2 if agreement else result
+                if not agreement:
+                    evidence = replace(evidence, text=first.text, segments=first.segments)
+            except Exception as error:
+                # OOM/missing model must degrade to clarification, never accepting the first guess.
+                evidence = replace(first, consensus=False, fallback_used=True,
+                    fallback_error=type(error).__name__, timings={**(first.timings or {}), "fallback_asr_complete": time.monotonic()})
+        if self.capture_validator:
+            self.capture_validator()
+        self.latest = evidence
+        result.metadata = {"atlas_segments": [asdict(s) for s in evidence.segments],
+                           "atlas_utterance": asdict(evidence)}
+        self.latest_result = result
+        return result
 
 
 class CalibrationLogger:

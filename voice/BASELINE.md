@@ -1,3 +1,6 @@
+> Historical M1 baseline. Voice M2 changes the uncertainty policy and adds a microphone lab;
+> see [VOICE_M2.md](VOICE_M2.md) for current behavior and measured host findings.
+
 # Desktop ASR baseline
 
 No owner dataset was present during the 2026-09-01 audit, so recognition, noise,

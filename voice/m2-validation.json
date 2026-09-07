@@ -1,0 +1,226 @@
+{
+  "schema_version": 2,
+  "date": "2026-09-06",
+  "scope": "Synthetic execution checks and unlabeled in-memory native levels; NOT owner recognition accuracy",
+  "host": {
+    "source": "alsa_input.pci-0000_06_00.6.analog-stereo",
+    "channels": 2,
+    "rate_hz": 48000,
+    "source_gain_db": 0,
+    "old_atlas_stream_gain_db": -48.04,
+    "repaired_atlas_stream_gain_db": 0,
+    "gpu_total_mib": 6144,
+    "current_source_volume_percent": 25,
+    "current_source_volume_db_approx": -36.12
+  },
+  "models": [
+    {
+      "model": "small.en",
+      "unique_synthetic_sentences": 1,
+      "equivalent_decodes": 3,
+      "hypotheses": [
+        "Explain PipeWire and WirePlumber on Arch Linux"
+      ],
+      "outcomes": [
+        "ACCEPT"
+      ],
+      "asr_ms_min": 197.1568330009177,
+      "asr_ms_max": 490.8244720027142,
+      "sampled_total_device_vram_mb": 1721.0
+    },
+    {
+      "model": "medium.en",
+      "unique_synthetic_sentences": 1,
+      "equivalent_decodes": 3,
+      "hypotheses": [
+        "Explain PipeWire and WirePlumber on Arch Linux"
+      ],
+      "outcomes": [
+        "CLARIFY"
+      ],
+      "asr_ms_min": 389.3824599981599,
+      "asr_ms_max": 425.30206800074666,
+      "sampled_total_device_vram_mb": 2429.0
+    },
+    {
+      "model": "large-v3-turbo",
+      "unique_synthetic_sentences": 1,
+      "equivalent_decodes": 3,
+      "hypotheses": [
+        "Explain PipeWire and WirePlumber on Arch Linux"
+      ],
+      "outcomes": [
+        "ACCEPT"
+      ],
+      "asr_ms_min": 430.1215259984019,
+      "asr_ms_max": 738.6037230025977,
+      "sampled_total_device_vram_mb": 2572.0
+    }
+  ],
+  "digital_silence": {
+    "synthetic_only": true,
+    "input": "one second digital silence",
+    "model": "small.en",
+    "decision": "REJECT",
+    "model_load_ms": 2938.9274940003816,
+    "asr_ms": 32.540747000894044,
+    "hypothesis": "",
+    "total_device_peak_vram_mb": 1602.0
+  },
+  "forced_cascade": {
+    "synthetic_only": true,
+    "forced_fallback": true,
+    "policy": {
+      "accept_avg_logprob": 0.0
+    },
+    "fallback_used": true,
+    "consensus": true,
+    "decision": "CLARIFY",
+    "elapsed_including_lazy_load_ms": 2263.0929489969276,
+    "total_device_peak_vram_mb": 2806.0
+  },
+  "checks": {
+    "voice_tests": 66,
+    "backend_tests": 72,
+    "full_recorder_startup": true,
+    "pulse_source_unity_open": true,
+    "aec_create_remove": true,
+    "aec_denoise_create_remove": true,
+    "synthetic_denoise_finite_and_length_preserving": true,
+    "direct_pipewire_recorder_startup": true,
+    "live_helper_source_verified": true
+  },
+  "owner_evaluation": {
+    "channel_comparison": null,
+    "raw_vs_processed": null,
+    "wrong_accept_rate": null,
+    "latency_p50_ms": null,
+    "latency_p95_ms": null,
+    "model_ranking": null,
+    "saved_recordings": 0,
+    "labeled_utterances": 0
+  },
+  "filters_promoted": [],
+  "filters_rejected_for_worse_asr": [],
+  "continued_date": "2026-09-07",
+  "native_level_probe": {
+    "source": "alsa_input.pci-0000_06_00.6.analog-stereo",
+    "audio_saved": false,
+    "speech_reference": null,
+    "before_volume": {
+      "front-left": {
+        "value": 65536,
+        "value_percent": "100%",
+        "db": "0.00 dB"
+      },
+      "front-right": {
+        "value": 65536,
+        "value_percent": "100%",
+        "db": "0.00 dB"
+      }
+    },
+    "before_channels": [
+      {
+        "rms": 0.9660140953683026,
+        "rms_dbfs": -0.30033073264223475,
+        "peak": 1.0,
+        "clipping_fraction": 0.9001458333333333,
+        "noise_floor_dbfs": null,
+        "estimated_snr_db": null,
+        "duration_s": 1.0,
+        "noise_method": "unavailable"
+      },
+      {
+        "rms": 0.965573490402416,
+        "rms_dbfs": -0.3042933240382895,
+        "peak": 1.0,
+        "clipping_fraction": 0.899,
+        "noise_floor_dbfs": null,
+        "estimated_snr_db": null,
+        "duration_s": 1.0,
+        "noise_method": "unavailable"
+      }
+    ],
+    "change": "physical built-in source volume set to 50%; other source/sink volumes untouched",
+    "after_volume": {
+      "front-left": {
+        "value": 32768,
+        "value_percent": "50%",
+        "db": "-18.06 dB"
+      },
+      "front-right": {
+        "value": 32768,
+        "value_percent": "50%",
+        "db": "-18.06 dB"
+      }
+    },
+    "after_channels": [
+      {
+        "rms": 0.28010581582200467,
+        "rms_dbfs": -11.053557476996478,
+        "peak": 1.2497601509094238,
+        "clipping_fraction": 0.005083333333333333,
+        "noise_floor_dbfs": null,
+        "estimated_snr_db": null,
+        "duration_s": 1.0,
+        "noise_method": "unavailable"
+      },
+      {
+        "rms": 0.2723148726424586,
+        "rms_dbfs": -11.298572775098332,
+        "peak": 1.2497601509094238,
+        "clipping_fraction": 0.0025833333333333333,
+        "noise_floor_dbfs": null,
+        "estimated_snr_db": null,
+        "duration_s": 1.0,
+        "noise_method": "unavailable"
+      }
+    ]
+  },
+  "native_headroom_probe": {
+    "source": "alsa_input.pci-0000_06_00.6.analog-stereo",
+    "source_volume_percent": 25,
+    "source_volume_db": -36.1236,
+    "audio_saved": false,
+    "speech_reference": null,
+    "settled_channels": [
+      {
+        "rms": 0.15135310131273338,
+        "rms_dbfs": -16.40017351341378,
+        "peak": 0.9830828309059143,
+        "clipping_fraction": 0.0,
+        "noise_floor_dbfs": null,
+        "estimated_snr_db": null,
+        "duration_s": 2.0,
+        "noise_method": "unavailable"
+      },
+      {
+        "rms": 0.1398507538356008,
+        "rms_dbfs": -17.086703766291077,
+        "peak": 0.7282756567001343,
+        "clipping_fraction": 0.0,
+        "noise_floor_dbfs": null,
+        "estimated_snr_db": null,
+        "duration_s": 2.0,
+        "noise_method": "unavailable"
+      }
+    ],
+    "channel_correlation": 0.7353706363995159
+  },
+  "manual_feed_integration": {
+    "synthetic_only": true,
+    "hypothesis": "Explain PipeWire and WirePlumber on Arch Linux.",
+    "decision": "ACCEPT",
+    "events": [
+      [
+        "onset",
+        83593.751164897
+      ],
+      [
+        "end",
+        83597.522951367
+      ]
+    ],
+    "inference_count": 1
+  }
+}

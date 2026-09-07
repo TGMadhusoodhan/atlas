@@ -20,7 +20,8 @@ def evidence(text="open Atlas", *, logprob=-0.2, no_speech=0.1, compression=1.1,
     segment = SegmentEvidence(text, 0.0, 1.0, token_count, logprob, no_speech,
                               compression, temperature)
     return TranscriptEvidence(text, (segment,), logprob, no_speech, compression,
-                              temperature, 1.0)
+                              temperature, 1.0, vad_probability=.95, speech_fraction=.7, snr_db=20,
+                              rms_dbfs=-24, clipping_fraction=0)
 
 
 class DeviceSelectionTest(unittest.TestCase):
@@ -36,11 +37,11 @@ class DeviceSelectionTest(unittest.TestCase):
 
 
 class AssessmentRulesTest(unittest.TestCase):
-    def test_high_no_speech_alone_does_not_drop_speech(self):
-        self.assertIs(Assessment.ACCEPT, assess_transcript(
+    def test_high_no_speech_rejects_even_confident_decode(self):
+        self.assertIs(Assessment.SILENCE, assess_transcript(
             evidence(no_speech=.99, logprob=-.1), {}).kind)
 
-    def test_silence_requires_high_no_speech_and_low_log_probability(self):
+    def test_high_no_speech_and_low_probability_reject(self):
         self.assertIs(Assessment.SILENCE, assess_transcript(
             evidence(no_speech=.9, logprob=-1.0), {}).kind)
 
